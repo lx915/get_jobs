@@ -74,6 +74,25 @@ public class Boss {
     private static final boolean USE_UI_SEARCH = false;
     /** 等待页面加载状态的超时（毫秒），绝不能不设 —— 见 waitForPageSettled 的说明 */
     private static final double LOAD_STATE_TIMEOUT = 10_000;
+    /** 岗位列表容器的等待超时（毫秒） */
+    private static final double JOB_LIST_TIMEOUT = 10_000;
+    /**
+     * 岗位详情接口的等待超时（毫秒）。
+     * <p>
+     * 原来完全不设超时，于是走 Playwright 的页面默认值 30 秒 —— 详情接口被限流/风控拦掉时，
+     * 每个岗位都要白等半分钟才继续，界面上看着就是"卡住不动"。
+     */
+    private static final double DETAIL_RESPONSE_TIMEOUT = 8_000;
+    /**
+     * 招呼语兜底文案。
+     * <p>
+     * 两个来源都可能为空：前端压根没有 sayHi 输入框（boss_config.say_hi 一直是 NULL），
+     * AI 提示词/密钥没配好时 generateAiMessage 也返回 null。两者都空时 message 就是 null，
+     * 紧接着的 input.fill(null) 会被 patchright 驱动直接拒绝（value: expected string, got undefined），
+     * 异常冒泡到关键词层，导致这一个关键词下的所有岗位全部被跳过 —— 就是"点了开始投递却什么都没发生"。
+     * 有兜底之后，最坏情况也只是招呼语不个性化，不会让投递整体失效。
+     */
+    private static final String DEFAULT_SAY_HI = "您好，我对这个职位很感兴趣，期待与您进一步沟通。";
 
     /**
      * 进度回调接口
@@ -238,6 +257,10 @@ public class Boss {
             // 进列表页 + 等列表渲染，整段带重试
             openJobListWithRetry(keyword, url, cityCode);
 
+            // 加载全部岗位要滚动 20~30 秒。这段时间界面必须一直在动，
+            // 否则用户会以为卡死、直接点「停止投递」——实测就这样白跑了 4 次（每次约 50 秒后取消）。
+            progressCallback.accept("【" + keyword + "】列表已打开，正在加载全部岗位…", 0, 0);
+
             // 1. 基于 footer 出现滚动到底，确保加载全部岗位
             int lastCount = -1;
             int stableTries = 0;
@@ -273,15 +296,37 @@ public class Boss {
                     // 按视口高度的90%渐进滚动，触发懒加载
                     page.evaluate("() => window.scrollBy(0, Math.floor(window.innerHeight * 1.5))");
 
+                    // ⚠️ 这一秒不能省。原来这里滚完立刻数卡片，8 轮"无新增"能在 1 秒内跑完，
+                    // 而 Boss 追加下一批卡片要走网络、要 1~2 秒才渲染出来 ——
+                    // 于是循环永远在"还没加载出来"的窗口里数到同一个数，直接判定加载完毕。
+                    // 实测：同一 URL 探针滚到底是 300 个岗位，应用只拿到 15 个（首屏数量），
+                    // 用户看到的就是"岗位很少"。等一拍再数，数量才对得上。
+                    PlaywrightUtil.sleep(1);
+
                     // 获取卡片数量变化，判断是否需要强制触底
                     Locator cardsProbe = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
                     int currentCount = cardsProbe.count();
+
+                    // currentCount == 0 是 Boss 重渲染时的瞬时抖动，不是"岗位真的没了"：
+                    // 实测滚动过程中会突然读到 0（日志里出现过 `已加载 0 个`），下一轮又回到 285。
+                    // 如果不跳过，这个 0 会打断稳定判定；严重时连着两轮读到 0，
+                    // 就会被下面的 stableTries 逻辑当成"已加载完毕"而提前收工。
+                    if (currentCount == 0 && lastCount > 0) {
+                        PlaywrightUtil.sleep(1);
+                        continue;
+                    }
+
                     if (currentCount == lastCount) {
                         stableTries++;
                     } else {
                         stableTries = 0;
                     }
                     lastCount = currentCount;
+
+                    // 每 5 轮报一次进度：让「投递进度」面板在滚动期间持续有输出
+                    if (i % 5 == 0) {
+                        progressCallback.accept("【" + keyword + "】正在加载岗位列表… 已加载 " + currentCount + " 个", 0, 0);
+                    }
 
                     if (stableTries >= 3) { // 连续多次无新增，则强制触底一次
                         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
@@ -332,6 +377,16 @@ public class Boss {
                 cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
                 // 在点击卡片时同步等待岗位详情接口返回，随后解析并入库
                 Response detailResp = null;
+                Page.WaitForResponseOptions detailWait = new Page.WaitForResponseOptions()
+                        .setTimeout(DETAIL_RESPONSE_TIMEOUT);
+                java.util.function.Predicate<Response> isJobDetailResp = r -> {
+                    try {
+                        return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
+                                && "GET".equalsIgnoreCase(r.request().method());
+                    } catch (Throwable ignore) {
+                        return false;
+                    }
+                };
                 try {
                     if (i == 0 && count > 1) {
                         // 第一个卡片默认展开不会触发请求：先切到第二个，再切回第一个，并在返回第一个时监听响应
@@ -339,22 +394,13 @@ public class Boss {
                         secondCard.click();
                         PlaywrightUtil.sleep(1);
                         final Locator firstCard = cards.nth(0);
-                        detailResp = page.waitForResponse(r -> {
-                            try {
-                                return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
-                                        && "GET".equalsIgnoreCase(r.request().method());
-                            } catch (Throwable ignore) { return false; }
-                        }, firstCard::click);
+                        detailResp = page.waitForResponse(isJobDetailResp, detailWait, firstCard::click);
                     } else {
                         final Locator cardToClick = cards.nth(i);
-                        detailResp = page.waitForResponse(r -> {
-                            try {
-                                return r.url() != null && r.url().contains("/wapi/zpgeek/job/detail.json")
-                                        && "GET".equalsIgnoreCase(r.request().method());
-                            } catch (Throwable ignore) { return false; }
-                        }, cardToClick::click);
+                        detailResp = page.waitForResponse(isJobDetailResp, detailWait, cardToClick::click);
                     }
                 } catch (Throwable ignore) {
+                    // 详情接口没回来（超时 / 被限流）不阻断流程，下面退回从卡片 DOM 取信息
                 }
                 PlaywrightUtil.sleep(1);
 
@@ -409,6 +455,31 @@ public class Boss {
                     }
                 }
 
+                // 详情接口没拿到时（超时/被限流）退回从卡片 DOM 读，
+                // 否则岗位名和公司名全是 null：黑名单过滤会静默失效，AI 也拿不到 JD。
+                if (detailResp == null || !isValidString(jobName)) {
+                    try {
+                        Object dom = cards.nth(i).evaluate("""
+                                el => {
+                                  const t = s => { const n = el.querySelector(s); return n ? n.textContent.trim() : ''; };
+                                  const tags = Array.from(el.querySelectorAll('.tag-list li'))
+                                                     .map(x => x.textContent.trim()).filter(Boolean).join(', ');
+                                  return { name: t('.job-name'), salary: t('.salary'),
+                                           company: t('.company-name'), tags: tags };
+                                }""");
+                        if (dom instanceof java.util.Map<?, ?> m) {
+                            if (!isValidString(jobName)) jobName = str(m.get("name"));
+                            if (!isValidString(jobSalary)) jobSalary = str(m.get("salary"));
+                            if (!isValidString(bossCompany)) bossCompany = str(m.get("company"));
+                            String domTags = str(m.get("tags"));
+                            if (!domTags.isEmpty() && tags.isEmpty()) tags.add(domTags);
+                            log.warn("详情接口无数据，已退回卡片DOM读取 | 岗位：{} | 公司：{}", jobName, bossCompany);
+                        }
+                    } catch (Throwable e) {
+                        log.debug("卡片DOM兜底读取失败：{}", e.getMessage());
+                    }
+                }
+
                 // 过滤（全部基于 JSON 字段），并输出过滤原因
                 if (jobName != null && blackJobs != null && blackJobs.stream().anyMatch(jobName::contains)) {
                     String term = findMatchedTerm(blackJobs, jobName);
@@ -441,9 +512,25 @@ public class Boss {
                 job.setRecruiter(bossName != null ? bossName : "");
                 job.setJobInfo(jobDesc != null ? jobDesc : "");
 
-                // 输出
-                progressCallback.accept("正在投递：" + jobName, i + 1, count);
-                resumeSubmission(keyword, job);
+                // 输出。jobName 可能为 null（例如详情接口没返回），直接拼会推出
+                // "正在投递：null" 这种让人以为出错了的日志，这里兜一下。
+                progressCallback.accept("正在投递：" + (jobName == null || jobName.isBlank() ? "（岗位名未取到）" : jobName), i + 1, count);
+
+                // ⚠️ 单岗位级隔离：一个岗位出问题绝不能让整个关键词报废。
+                // 上游是直接把异常冒泡到关键词级 catch（本方法最外层那个），
+                // 而一个关键词通常有 100~300 个岗位 —— 等于"第一个岗位出错，后面全跳过"。
+                // 实测（Boss 与智联同时跑时）就这样连丢 4 个关键词、只投出 2 个：
+                //   Object doesn't exist: frame@...  / handle@...
+                try {
+                    resumeSubmission(keyword, job);
+                } catch (Exception jobEx) {
+                    log.warn("岗位投递失败，跳过该岗位继续 | 公司：{} | 岗位：{} | 原因：{}",
+                            job.getCompanyName(), job.getJobName(), jobEx.getMessage());
+                    if (progressCallback != null) {
+                        progressCallback.accept("跳过该岗位（" + jobEx.getMessage() + "）："
+                                + (jobName == null ? "" : jobName), i + 1, count);
+                    }
+                }
                 postCount++;
 
                 // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑
@@ -885,12 +972,23 @@ public class Boss {
                 last = e;
                 log.warn("【{}】进入岗位列表失败（第{}/2次）：{}", keyword, attempt,
                         e.getMessage() == null ? e.toString() : e.getMessage().split("\n")[0]);
-                if (attempt < 2) {
-                    PlaywrightUtil.sleep(3);
+                // 风控 / 安全验证 / 登录失效 / 筛选无结果这几类，重试一次只是让用户多等一轮
+                if (attempt >= 2 || isNonRetryableListFailure(e)) {
+                    break;
                 }
+                PlaywrightUtil.sleep(3);
             }
         }
         throw last;
+    }
+
+    /** 这类失败重试没有意义，直接抛给上层，让前端把原因显示出来。 */
+    private static boolean isNonRetryableListFailure(Throwable e) {
+        String m = e.getMessage();
+        if (m == null) {
+            return false;
+        }
+        return m.contains("风控") || m.contains("安全验证") || m.contains("登录态") || m.contains("没有岗位");
     }
 
     /**
@@ -930,19 +1028,67 @@ public class Boss {
                 "li.job-card-box",
                 "li.job-card-wrapper");
 
-        for (int attempt = 1; attempt <= 3; attempt++) {
+        for (int attempt = 1; attempt <= 2; attempt++) {
             try {
                 page.waitForSelector(containers,
-                        new Page.WaitForSelectorOptions().setTimeout(15_000));
+                        new Page.WaitForSelectorOptions().setTimeout(JOB_LIST_TIMEOUT));
                 log.info("岗位列表容器已出现（第{}次尝试）", attempt);
                 return;
             } catch (Exception e) {
-                log.warn("等待岗位列表失败（第{}/3次），当前页面: {}", attempt, safeUrl());
+                // 先看页面到底在说什么。风控页 / 验证页 / 筛选无结果页都会让容器永远不出现，
+                // 这种情况下再等下去只是把"卡住"从 10 秒拉成几分钟，对结果没有任何帮助。
+                String reason = detectListBlockReason();
+                if (reason != null) {
+                    dumpListPageStructure();
+                    throw new IllegalStateException(reason + " | 当前页面: " + safeUrl());
+                }
+                log.warn("等待岗位列表失败（第{}/2次），当前页面: {}", attempt, safeUrl());
                 settleAfterNavigation();
             }
         }
         dumpListPageStructure();
-        throw new IllegalStateException("岗位列表始终未出现，当前页面: " + safeUrl());
+        // 把页面正文一起带上：Boss 改版/风控/空结果页的文案都不固定，
+        // 只报"列表没出现"等于什么都没说，下次还得再猜一轮。
+        throw new IllegalStateException("岗位列表始终未出现（页面正文：" + pageTextExcerpt() + "） | 当前页面: " + safeUrl());
+    }
+
+    /**
+     * 页面正文前 200 字，用来在列表迟迟不出现时说明"页面到底在说什么"。
+     */
+    private String pageTextExcerpt() {
+        try {
+            String text = String.valueOf(page.evaluate("() => (document.body ? document.body.innerText : '')"))
+                    .replaceAll("\\s+", " ")
+                    .trim();
+            return text.length() > 200 ? text.substring(0, 200) + "…" : text;
+        } catch (Exception e) {
+            return "(取不到正文)";
+        }
+    }
+
+    /**
+     * 判断岗位列表迟迟不出现，到底是哪种"再等也没用"的情况。
+     *
+     * @return 可直接展示给用户的原因；返回 null 表示只是还没渲染完，值得再等一轮
+     */
+    private String detectListBlockReason() {
+        try {
+            String text = String.valueOf(page.evaluate("() => (document.body ? document.body.innerText : '')"));
+            if (text.contains("您的环境存在异常")) {
+                return "触发Boss风控（您的环境存在异常），请先停止任务，稍后重试或换个网络";
+            }
+            if (text.contains("安全验证") || text.contains("滑动验证") || text.contains("请完成验证")) {
+                return "触发Boss安全验证，需要人工在浏览器里完成验证后再继续";
+            }
+            if (text.contains("请先登录") || text.contains("登录后查看") || text.contains("登录后可")) {
+                return "Boss登录态已失效，请重新登录后再投递";
+            }
+            if (text.contains("没有找到") || text.contains("暂无相关") || text.contains("未找到相关")) {
+                return "当前筛选条件下没有岗位，请放宽筛选（城市/经验/薪资/公司规模）后重试";
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
     }
 
     private String safeUrl() {
@@ -992,6 +1138,41 @@ public class Boss {
     }
 
     /**
+     * 打开岗位详情页，容忍 Playwright 的瞬时并发异常。
+     * <p>
+     * 新建标签页后立刻 {@code navigate()} 时，Playwright 可能抛
+     * {@code Object doesn't exist: frame@...} —— 那是连接在派发 frame 事件时
+     * 引用了已释放的对象，且**页面往往其实已经到位**。
+     * 仓库里智联侧早就为同一个异常写过容错（异常后再看 page.url() 是否已在站内），
+     * 这里照同样口径补一份，避免一个无害的瞬时异常直接把关键词打掉。
+     */
+    private void navigateDetailPage(Page detailPage, String detailUrl) {
+        try {
+            detailPage.navigate(detailUrl);
+            return;
+        } catch (Exception e) {
+            if (detailPageLooksLoaded(detailPage)) {
+                log.warn("详情页导航抛异常但页面已到位，按已加载处理: {}", e.getMessage());
+                return;
+            }
+            log.warn("详情页导航失败，2 秒后重试一次: {}", e.getMessage());
+        }
+        PlaywrightUtil.sleep(2);
+        // 再失败就让它冒泡 —— 由「岗位级」catch 兜住，只跳过这一个岗位
+        detailPage.navigate(detailUrl);
+    }
+
+    /** 详情页是否已经落在 zhipin.com 上（用来判定"异常但已到位"） */
+    private boolean detailPageLooksLoaded(Page p) {
+        try {
+            String url = p.url();
+            return url != null && url.contains("zhipin.com");
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    /**
      * 备注：目前Boss无法通过新标签页打开立即沟通按钮，所以只能点击更多详情，然后从更多详情里打开聊天按钮
      */
     @SneakyThrows
@@ -1022,7 +1203,7 @@ public class Boss {
         String detailUrl = "https://www.zhipin.com" + href;
         // 2. 在新窗口打开详情页
         Page detailPage = page.context().newPage();
-        detailPage.navigate(detailUrl);
+        navigateDetailPage(detailPage, detailUrl);
         PlaywrightUtil.sleep(1);
 
         // 3. 查找"立即沟通"按钮
@@ -1086,48 +1267,58 @@ public class Boss {
             }
         }
         String message = isValidString(aiMessage) ? aiMessage : config.getSayHi();
-
-        // 6. 输入打招呼语
-        Locator input = inputLocator.first();
-        input.click();
-        Object tagObj = input.evaluate("el => el.tagName.toLowerCase()");
-        if (tagObj instanceof String && ((String) tagObj).equals("textarea")) {
-            input.fill(message);
-        } else {
-            // 对 contenteditable 节点写入文本并派发 input 事件
-            input.evaluate("(el, msg) => { el.innerText = msg; el.dispatchEvent(new Event('input')); }", message);
+        // 兜底，见 DEFAULT_SAY_HI 的说明：这里为 null 会让整个关键词直接报废
+        if (!isValidString(message)) {
+            message = DEFAULT_SAY_HI;
+            log.warn("未配置招呼语且AI未生成，改用内置默认招呼语：{}", DEFAULT_SAY_HI);
         }
 
-        // 7. 点击发送按钮（div.send-message 或 button.btn-send）
-        Locator sendText = detailPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
         boolean sendSuccess = false;
-        if (sendText.count() > 0) {
-            sendText.first().click();
-            PlaywrightUtil.sleep(1);
-            sendSuccess = true;
-            try {
-                detailPage.locator("i.icon-close").first().click();
-            } catch (Exception e) {
-                log.error("发送文本小窗口关闭失败！");
-            }
-        } else {
-            log.warn("未找到发送按钮，自动跳过！岗位：{}", job.getJobName());
-        }
-
-        // 8. 发送图片简历（可选）
         boolean imgResume = false;
-        if (Boolean.TRUE.equals(config.getSendImgResume())) {
-            imgResume = sendImageResume(detailPage);
-        }
-
-        log.info("投递完成 | 公司：{} | 岗位：{} | 薪资：{} | 招呼语：{} | 图片简历：{}", job.getCompanyName(), job.getJobName(), job.getSalary(), message, imgResume ? "已发送" : "未发送");
-
-        // 9. 关闭新打开的详情页
+        // 从输入招呼语开始，任何一步抛异常都必须保证详情页被关掉。
+        // 否则聊天弹窗会一直留在浏览器里（用户截图里那个「订阅回复消息」窗口就是这么残留的），
+        // 之后每个关键词的导航和列表渲染都会被它干扰。
         try {
-            detailPage.close();
-        } catch (Exception ignore) {
+            // 6. 输入打招呼语
+            Locator input = inputLocator.first();
+            input.click();
+            Object tagObj = input.evaluate("el => el.tagName.toLowerCase()");
+            if (tagObj instanceof String && ((String) tagObj).equals("textarea")) {
+                input.fill(message);
+            } else {
+                // 对 contenteditable 节点写入文本并派发 input 事件
+                input.evaluate("(el, msg) => { el.innerText = msg; el.dispatchEvent(new Event('input')); }", message);
+            }
+
+            // 7. 点击发送按钮（div.send-message 或 button.btn-send）
+            Locator sendText = detailPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
+            if (sendText.count() > 0) {
+                sendText.first().click();
+                PlaywrightUtil.sleep(1);
+                sendSuccess = true;
+                try {
+                    detailPage.locator("i.icon-close").first().click();
+                } catch (Exception e) {
+                    log.error("发送文本小窗口关闭失败！");
+                }
+            } else {
+                log.warn("未找到发送按钮，自动跳过！岗位：{}", job.getJobName());
+            }
+
+            // 8. 发送图片简历（可选）
+            if (Boolean.TRUE.equals(config.getSendImgResume())) {
+                imgResume = sendImageResume(detailPage);
+            }
+
+            log.info("投递完成 | 公司：{} | 岗位：{} | 薪资：{} | 招呼语：{} | 图片简历：{}", job.getCompanyName(), job.getJobName(), job.getSalary(), message, imgResume ? "已发送" : "未发送");
+        } finally {
+            // 9. 无论成功失败都关闭新打开的详情页
+            try {
+                detailPage.close();
+            } catch (Exception ignore) {
+            }
+            PlaywrightUtil.sleep(1);
         }
-        PlaywrightUtil.sleep(1);
 
         // 10. 更新数据库投递状态 & 成功投递加入结果
         if (sendSuccess) {
@@ -1242,6 +1433,11 @@ public class Boss {
 
     public boolean isValidString(String str) {
         return str != null && !str.isEmpty();
+    }
+
+    /** 把 evaluate 返回的对象安全转成去掉首尾空白的字符串。 */
+    private static String str(Object o) {
+        return o == null ? "" : String.valueOf(o).trim();
     }
 
     private boolean sendImageResume(Page page) {

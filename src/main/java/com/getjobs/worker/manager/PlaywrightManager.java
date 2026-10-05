@@ -107,7 +107,10 @@ public class PlaywrightManager {
     // 外面包多少层 try/catch 都没用，实测把初始化卡了两分钟以上还在等。
     private static final double LOAD_STATE_TIMEOUT = 10_000;
 
-    // Boss 登录态 Cookie：出现任意一个即视为已登录
+    // Boss 登录态 Cookie 名单（仅作排查参考，已不再参与判定）。
+    // ⚠️ 2026-10-04 实测：未登录状态下浏览器里照样有 bst、wt2、zp_at，
+    // 拿它当"已登录"的证据会把未登录放行，最终表现为"点了开始投递却什么都投不到"。
+    @SuppressWarnings("unused")
     private static final Set<String> BOSS_LOGIN_COOKIES = Set.of("bst", "wt2", "zp_at", "geek_zp_token");
 
     // 持久化上下文的用户数据目录，登录态直接落在这里
@@ -264,6 +267,38 @@ public class PlaywrightManager {
     /** Playwright 线程上是否有前台任务在跑（投递、初始化等） */
     public boolean isPlaywrightBusy() {
         return playwrightQueueDepth.get() > 0;
+    }
+
+    // ------------------------------------------------------------------
+    // 前台投递名额：同一时刻只允许一个平台在浏览器里跑投递。
+    //
+    // 为什么必须显式拒绝，而不是让它排队：
+    //  1. 各平台的 Playwright 调用都收敛到 playwrightExecutor 这条专用线程上，
+    //     任务本身是**排队**执行的。第二个平台提交后会静默排在前一个后面 ——
+    //     前一轮可能跑几十分钟，界面上就是"点了开始投递什么都没发生"。
+    //  2. 更糟的是只要有平台绕开专用线程（实测智联此前就是：
+    //     /start 里 CompletableFuture.runAsync 之后直接在 ForkJoinPool 线程上
+    //     驱动 Playwright），两个线程就会同时操作同一条 Playwright 连接。
+    //     实测现象：Boss 侧连丢 4 个关键词（每个 200+ 岗位全废），
+    //     报 PlaywrightException: Object doesn't exist: frame@... / handle@...
+    //
+    // 所以这里抢占失败就直接告诉用户"另一个平台正在投递"，而不是闷头排队。
+    // ------------------------------------------------------------------
+    private final java.util.concurrent.atomic.AtomicReference<String> foregroundPlatform =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * 抢占前台投递名额。
+     *
+     * @return {@code null} = 抢占成功；非 null = 已被该平台占用
+     */
+    public String acquireForeground(String platform) {
+        return foregroundPlatform.compareAndSet(null, platform) ? null : foregroundPlatform.get();
+    }
+
+    /** 释放前台投递名额。只有持有者能释放，避免误放别人的名额。 */
+    public void releaseForeground(String platform) {
+        foregroundPlatform.compareAndSet(platform, null);
     }
 
     private static RuntimeException toRuntime(Throwable throwable) {
@@ -573,19 +608,35 @@ public class PlaywrightManager {
      * 检查Boss是否已登录
      */
     private boolean checkIfLoggedIn() {
-        // 最可靠的信号是登录态 Cookie：不受页面渲染、跳转、加载速度影响。
-        // DOM 探测（头像、登录入口）只作兜底 —— 页面一慢就会误判成未登录，
-        // 而 /api/boss/start 是拿这个结果做准入的，误判会直接导致"请先登录"。
+        // ⚠️ 这套判定踩过两次坑，改之前先看完：
+        // 1) 原实现把 Cookie 判断放最前面，注释写着"最可靠、不受页面渲染影响"。但 2026-10-04 实测：
+        //    未登录状态下浏览器里同样有 bst / wt2 / zp_at（匿名访客也会被下发），
+        //    于是"没登录"被判成"已登录" → /api/boss/start 准入放行 → 投递任务正常跑完 →
+        //    但筛选搜索被 Boss 换成匿名页、返回 0 个岗位 → 用户看到的就是"点了开始投递，一点动静都没有"。
+        //    所以 Cookie 现在完全不参与判定（字段保留只为排查时对照）。
+        // 2) 判定必须"先否后是"：停在登录页、或头部出现「登录/注册」，都是确定未登录的否决信号。
+        //    只靠头像这类正向证据不够 —— 登录页上根本没有头像，会被误读成"还在加载"。
+
+        // 1) 停在登录页 → 确定未登录
         try {
-            for (Cookie cookie : context.cookies(BOSS_URL)) {
-                if (BOSS_LOGIN_COOKIES.contains(cookie.name)
-                        && cookie.value != null && !cookie.value.isBlank()) {
-                    return true;
+            String currentUrl = bossPage.url();
+            if (currentUrl != null && currentUrl.contains("/web/user/")) {
+                return false;
+            }
+        } catch (Exception ignored) {}
+
+        // 2) 头部出现「登录/注册」入口 → 确定未登录（匿名访客必然能看到它）
+        try {
+            Locator loginAnchor = bossPage.locator("li.nav-sign a, .btns").first();
+            if (isVisibleQuick(loginAnchor)) {
+                String text = loginAnchor.textContent(new Locator.TextContentOptions().setTimeout(LOCATOR_PROBE_TIMEOUT));
+                if (text != null && text.contains("登录")) {
+                    return false;
                 }
             }
         } catch (Exception ignored) {}
 
-        // 更稳健的登录判断：优先检测用户头像/昵称是否可见；备用检测登录入口是否可见且包含“登录”文本
+        // 3) 正向证据：用户头像/昵称可见
         try {
             Locator userLabel = bossPage.locator("li.nav-figure span.label-text").first();
             if (isVisibleQuick(userLabel)) {
@@ -601,18 +652,8 @@ public class PlaywrightManager {
             }
         } catch (Exception ignored) {}
 
-        try {
-            // 未登录时通常有“登录/注册”入口或按钮容器
-            Locator loginAnchor = bossPage.locator("li.nav-sign a, .btns").first();
-            if (isVisibleQuick(loginAnchor)) {
-                String text = loginAnchor.textContent(new Locator.TextContentOptions().setTimeout(LOCATOR_PROBE_TIMEOUT));
-                if (text != null && text.contains("登录")) {
-                    return false;
-                }
-            }
-        } catch (Exception ignored) {}
-
-        // 无法明确检测到登录特征时，保守返回未登录
+        // 无法明确检测到登录特征时，保守返回未登录。
+        // 这里刻意"失败即未登录"：宁可让用户多点一次扫码，也不要放行一个 0 岗位的空跑。
         return false;
     }
 
@@ -1867,6 +1908,46 @@ public class PlaywrightManager {
         browserClosed = false;
         loginStatus.clear();
         init();
+    }
+
+    /**
+     * 取一个可用的智联招聘 Page；不可用就地重建。
+     * <p>
+     * 只靠 ensureReady() 只能救"整个浏览器没了"（browserClosed 被置位）那种情况。
+     * 实测还有更常见的一种：浏览器活得好好的、别的平台页也正常，唯独智联这个标签页被
+     * 单独关掉了（用户手动关标签页、页面自身崩溃重启）。此时 browserClosed 仍是 false，
+     * ensureReady() 直接短路返回，而 zhilianPage 已经失效 —— 之后 page.navigate 一律抛
+     * TargetClosedError，智联投递就在这一行静默变成"共投递0个岗位，用时0秒"。
+     * 所以这里额外补一层 Page 级别的健康检查。
+     */
+    public synchronized Page ensureZhilianPage() {
+        // 1) 整个浏览器没了 -> 走整体重建（会重建全部平台页）
+        if (playwright == null || context == null || browserClosed) {
+            ensureReady();
+        }
+
+        // 2) 浏览器还在，但智联这一页被关掉了 -> 只重建这一页
+        try {
+            if (zhilianPage != null && !zhilianPage.isClosed()) {
+                return zhilianPage;
+            }
+        } catch (Exception e) {
+            log.warn("读取智联招聘 Page 状态失败，按已关闭处理: {}", e.getMessage());
+        }
+
+        log.warn("智联招聘 Page 不可用（已关闭），重新创建...");
+        zhilianPage = context.newPage();
+        zhilianPage.setDefaultTimeout(DEFAULT_TIMEOUT);
+        // 新页面落在同一个持久化上下文里，Cookie 仍是登录态，先回首页让投递流程直接接着走。
+        // 导航失败不致命：投递流程自己还会 navigate 到搜索页。
+        try {
+            zhilianPage.navigate(ZHILIAN_URL, new Page.NavigateOptions()
+                    .setTimeout(60000)
+                    .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+        } catch (Exception e) {
+            log.warn("重建后的智联招聘页面导航失败（不影响后续投递尝试）: {}", e.getMessage());
+        }
+        return zhilianPage;
     }
 
     /**

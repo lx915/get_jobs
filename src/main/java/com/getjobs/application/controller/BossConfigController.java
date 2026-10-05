@@ -70,6 +70,23 @@ public class BossConfigController {
         // 关键词标准化：将来自前端的逗号分隔或括号列表统一转换为 JSON 字符串列表
         config.setKeywords(normalizeKeywords(config.getKeywords()));
 
+        // 空串归一为 null（重要，别删）。
+        // 前端保存时会无条件把这几个多选字段一起发出来，未选中任何项时值是空串 ""，
+        // 而持久层（updateById / saveOrUpdateFirstSelective）只跳过 null、不跳过空串，
+        // 空串会被当作有效值写库，把数据库里已有的筛选条件清成空 —— 表现为
+        // 「页面上明明选过，一保存就没了」。
+        // 归一成 null 后这些字段按「本次未提供」处理，保持原值。
+        // 注意：要清空某个筛选条件，请在页面上显式选择「不限」，不要指望留空。
+        // （keywords 不在其列：关键词输入框是纯文本，清空即代表用户想清空，故保留原行为。）
+        config.setCityCode(blankToNull(config.getCityCode()));
+        config.setIndustry(blankToNull(config.getIndustry()));
+        config.setJobType(blankToNull(config.getJobType()));
+        config.setExperience(blankToNull(config.getExperience()));
+        config.setDegree(blankToNull(config.getDegree()));
+        config.setSalary(blankToNull(config.getSalary()));
+        config.setScale(blankToNull(config.getScale()));
+        config.setStage(blankToNull(config.getStage()));
+
         // 将前端可能传来的『代码列表』转换并保存成『中文名称列表/值』
         // 城市：保存中文名（单值）
         if (config.getCityCode() != null) {
@@ -130,6 +147,16 @@ public class BossConfigController {
      * 3) 括号列表："[大模型,Python]" 或 "[\"大模型\",\"Python\"]"
      * 4) JSON 数组："["大模型","Python"]"
      */
+    /**
+     * 把 null 或纯空白字符串归一成 null，其余原样返回（会去掉首尾空白）。
+     * 用于让「前端没填 / 多选框为空」等价于「本次不修改该字段」。
+     */
+    private String blankToNull(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim();
+        return s.isEmpty() ? null : s;
+    }
+
     private String normalizeKeywords(String raw) {
         if (raw == null) return null;
         String s = raw.trim();

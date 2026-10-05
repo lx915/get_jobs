@@ -48,6 +48,9 @@ public class ZhilianService {
             config.setKeywords(new ArrayList<>());
             config.setCityCode("0");
             config.setSalary("0");
+            config.setEducationCodes(new ArrayList<>());
+            config.setCompanySizeCodes(new ArrayList<>());
+            config.setDebugger(false);
             return config;
         }
 
@@ -70,20 +73,106 @@ public class ZhilianService {
             }
         }
 
-        // 薪资：缺省或“不限”映射为 0，其它保持原值
-        String salary = safeTrim(entity.getSalary());
-        if (salary == null || salary.isEmpty() || "不限".equals(salary)) {
-            config.setSalary("0");
-        } else {
-            config.setSalary(salary);
-        }
+        // 薪资：库里存的可能是字典代码（"25001,35000"）或中文档位（"25K-35K"），
+        // 也可能还是旧版的裸数字（"20000"）。统一解析成智联 URL 要的区间代码，
+        // 解析不出来就返回 "0" = 不加该条件（详见 resolveSalaryCode 的注释）。
+        config.setSalary(resolveSalaryCode(entity.getSalary()));
+
+        // 学历 / 公司人数：库里存代码或中文名都认，统一解析成智联 URL 用的代码。
+        // 留空 = 不加该筛选条件（≠ 传 "0"）。
+        config.setEducationCodes(resolveOptionCodes("education", entity.getEducation()));
+        config.setCompanySizeCodes(resolveOptionCodes("companySize", entity.getCompanySize()));
+        config.setDebugger(entity.getDebugger() != null && entity.getDebugger() == 1);
+
         return config;
+    }
+
+    /**
+     * 把库里存的「多选筛选值」解析成智联要的代码列表。
+     * <p>
+     * 同时兼容用户直接填代码（"4,3"）和填中文名（"本科、硕士"）两种写法 ——
+     * 和 cityCode 的处理口径保持一致。解析不出来的值直接丢弃，
+     * 宁可少一个筛选条件，也不要把脏值拼进 URL 让智联返回 0 个岗位。
+     */
+    public List<String> resolveOptionCodes(String type, String raw) {
+        List<String> tokens = parseListString(raw);
+        List<String> codes = new ArrayList<>();
+        for (String token : tokens) {
+            if (token == null || token.isEmpty()) continue;
+            if (token.chars().allMatch(Character::isDigit)) {
+                if (!"0".equals(token) && !codes.contains(token)) codes.add(token);
+                continue;
+            }
+            String code = getCodeByTypeAndName(type, token);
+            if (code == null) {
+                // 再试一次：万一表里存的就是代码而用户误填了名字大小写
+                ZhilianOptionEntity byCode = getOptionByTypeAndCode(type, token);
+                if (byCode != null && !codes.contains(byCode.getCode())) codes.add(byCode.getCode());
+                else log.warn("智联配置中的 {} 取值 {} 未在 zhilian_option 表中找到，已忽略", type, token);
+            } else if (!"0".equals(code) && !codes.contains(code)) {
+                codes.add(code);
+            }
+        }
+        return codes;
+    }
+
+    /**
+     * 解析薪资档位，返回智联 URL 用的区间代码（形如 {@code "25001,35000"}）。
+     * <p>
+     * ⚠️ 与学历 / 公司人数不同，**智联薪资档的代码本身含逗号**，所以绝不能走
+     * {@link #parseListString} —— 那会把一个档位切成两个残缺数字，拼进 URL 后
+     * 静默失效（这正是"薪资范围没有生效"的根因）。
+     * <p>
+     * 接受的写法（按优先级）：
+     * <ol>
+     *   <li>已经是区间代码：{@code "25001,35000"}（两段都必须是数字才放行）；</li>
+     *   <li>字典里的代码但只有一个值：查 {@code zhilian_option}；</li>
+     *   <li>中文档位名：{@code "25K-35K"}；</li>
+     *   <li>旧版遗留的裸数字：{@code "20000"} → 当作"月薪下限 20K 以上"，
+     *       即 {@code "20000,9999999"}（实测服务端接受任意区间码）。</li>
+     * </ol>
+     * 都解析不出来时返回 {@code "0"} = 不加该筛选条件。
+     */
+    public String resolveSalaryCode(String raw) {
+        if (raw == null) return "0";
+        String v = raw.trim();
+        if (v.isEmpty() || "不限".equals(v) || "0".equals(v)) return "0";
+
+        if (v.contains(",")) {
+            String[] parts = v.split(",", 2);
+            String lo = parts[0].trim(), hi = parts[1].trim();
+            if (!lo.isEmpty() && !hi.isEmpty()
+                    && lo.chars().allMatch(Character::isDigit)
+                    && hi.chars().allMatch(Character::isDigit)) {
+                return lo + "," + hi;
+            }
+            log.warn("智联配置中的薪资取值 {} 不是合法的区间代码，已忽略", v);
+            return "0";
+        }
+
+        ZhilianOptionEntity byCode = getOptionByTypeAndCode("salary", v);
+        if (byCode != null) return byCode.getCode();
+        String byName = getCodeByTypeAndName("salary", v);
+        if (byName != null) return byName;
+
+        if (v.chars().allMatch(Character::isDigit)) {
+            return v + ",9999999";
+        }
+        log.warn("智联配置中的薪资取值 {} 未在 zhilian_option 表中找到，已忽略", v);
+        return "0";
     }
 
     public List<String> parseListString(String raw) {
         if (raw == null || raw.trim().isEmpty()) return new ArrayList<>();
-        String s = raw.trim().replace('，', ',');
-        if (s.startsWith("[") && s.endsWith("]")) s = s.substring(1, s.length() - 1);
+        // 分隔符要认全：中文顿号「、」和分号「；」在国内用户里非常常用。
+        // 以前只认 , 和 ，于是界面上填的 "JAVA、后端、Spring" 会被整串当成**一个**关键词，
+        // 原样塞进智联搜索框 —— 必然搜不到任何岗位，表现又是"投递0个岗位"。
+        // 同时把方括号和引号一次性抹掉：若先按顿号切开，`["JAVA、后端、Spring"]`
+        // 的第一个片段会变成 `"JAVA`（只剩前半个引号），stripWrapperQuotes 就兜不住了。
+        String s = raw.trim()
+                .replace('，', ',').replace('、', ',').replace('；', ',').replace(';', ',')
+                .replace("[", "").replace("]", "")
+                .replace("\"", "").replace("'", "");
         if (s.trim().isEmpty()) return new ArrayList<>();
         return java.util.Arrays.stream(s.split(","))
                 .map(String::trim)
@@ -93,6 +182,51 @@ public class ZhilianService {
     }
 
     private String safeTrim(String s) { return s == null ? null : s.trim(); }
+
+    /**
+     * 构建智联新搜索页的 URL（投递与诊断接口共用同一份实现，避免两处漂移）。
+     * <p>
+     * 参数：{@code kw} 关键词 / {@code jl} 城市 / {@code sl} 薪资 / {@code el} 学历 /
+     * {@code cs} 公司人数 / {@code p} 页码。学历与公司人数多选用逗号分隔。
+     * <p>
+     * 三个必须记住的坑（均为实测结论）：
+     * <ol>
+     *   <li>关键词必须放在 URL 里。旧实现是"打开空搜索页再用输入框打字"，
+     *       而新页面在跳转后会把关键词丢掉。</li>
+     *   <li>"不限城市"必须**整个不传 jl**，不能传 {@code jl=0} ——
+     *       {@code ?kw=Java&jl=0} 会返回 0 个岗位，而完全不传 jl 才是全国。</li>
+     *   <li>{@code sl} 是**"最低,最高"的区间对**（如 {@code 25001,35000}），
+     *       裸数字会被静默忽略。它的筛选语义是"岗位薪资区间与所选档位**有交集**"，
+     *       不是"完全落在档位内"。</li>
+     * </ol>
+     */
+    public String buildZhilianSearchUrl(ZhilianConfig config, String keyword, int pageNum) {
+        StringBuilder sb = new StringBuilder("https://www.zhaopin.com/jobs?kw=");
+        sb.append(java.net.URLEncoder.encode(keyword == null ? "" : keyword,
+                java.nio.charset.StandardCharsets.UTF_8));
+
+        String city = config == null ? null : config.getCityCode();
+        if (city != null) city = city.trim();
+        if (city != null && !city.isEmpty() && !"0".equals(city) && !"不限".equals(city)) {
+            sb.append("&jl=").append(city);
+        }
+
+        String salary = config == null ? null : config.getSalary();
+        if (salary != null && !salary.trim().isEmpty()
+                && !"0".equals(salary.trim()) && !"不限".equals(salary.trim())) {
+            sb.append("&sl=").append(salary.trim());
+        }
+
+        if (config != null && config.getEducationCodes() != null && !config.getEducationCodes().isEmpty()) {
+            sb.append("&el=").append(String.join(",", config.getEducationCodes()));
+        }
+        if (config != null && config.getCompanySizeCodes() != null && !config.getCompanySizeCodes().isEmpty()) {
+            sb.append("&cs=").append(String.join(",", config.getCompanySizeCodes()));
+        }
+
+        sb.append("&p=").append(pageNum);
+        return sb.toString();
+    }
 
     private String stripWrapperQuotes(String value) {
         if (value == null || value.length() < 2) return value;
@@ -127,6 +261,9 @@ public class ZhilianService {
             toInsert.setKeywords(incoming.getKeywords());
             toInsert.setCityCode(incoming.getCityCode());
             toInsert.setSalary(incoming.getSalary());
+            toInsert.setEducation(incoming.getEducation());
+            toInsert.setCompanySize(incoming.getCompanySize());
+            toInsert.setDebugger(incoming.getDebugger() == null ? 0 : incoming.getDebugger());
             toInsert.setCreatedAt(now);
             toInsert.setUpdatedAt(now);
             zhilianConfigMapper.insert(toInsert);
@@ -137,6 +274,11 @@ public class ZhilianService {
             if (incoming.getKeywords() != null) toUpdate.setKeywords(incoming.getKeywords());
             if (incoming.getCityCode() != null) toUpdate.setCityCode(incoming.getCityCode());
             if (incoming.getSalary() != null) toUpdate.setSalary(incoming.getSalary());
+            // 学历/公司人数允许被清空（空串 = 取消该筛选），所以只要非 null 就落库
+            if (incoming.getEducation() != null) toUpdate.setEducation(incoming.getEducation());
+            if (incoming.getCompanySize() != null) toUpdate.setCompanySize(incoming.getCompanySize());
+            // 调试模式是 0/1 的开关，必须能被关掉，所以同样只要非 null 就落库
+            if (incoming.getDebugger() != null) toUpdate.setDebugger(incoming.getDebugger());
             toUpdate.setCreatedAt(first.getCreatedAt());
             toUpdate.setUpdatedAt(now);
             zhilianConfigMapper.updateById(toUpdate);
@@ -202,6 +344,95 @@ public class ZhilianService {
         } catch (Exception e) {
             log.warn("创建 zhilian_data 表失败: {}", e.getMessage());
         }
+
+        // zhilian_config 由 sqlite 脚本初始化，早期建表时没有学历/公司人数/调试模式这几列。
+        // 这里做一次幂等补列，避免"升级代码但没升级库"导致启动后立即报 no such column。
+        ensureConfigColumns();
+        seedFilterOptions();
+    }
+
+    /** 幂等补列：SQLite 对已存在的列会抛异常，直接吞掉即可。 */
+    private void ensureConfigColumns() {
+        String[][] columns = {
+                {"education", "ALTER TABLE zhilian_config ADD COLUMN education VARCHAR(100)"},
+                {"company_size", "ALTER TABLE zhilian_config ADD COLUMN company_size VARCHAR(100)"},
+                {"debugger", "ALTER TABLE zhilian_config ADD COLUMN debugger INTEGER DEFAULT 0"},
+        };
+        try (Connection conn = dataSource.getConnection(); Statement stmt = conn.createStatement()) {
+            for (String[] col : columns) {
+                try {
+                    stmt.execute(col[1]);
+                    log.info("zhilian_config 已补充列: {}", col[0]);
+                } catch (Exception alreadyExists) {
+                    // 列已存在，属于正常情况
+                }
+            }
+        } catch (Exception e) {
+            log.warn("补充 zhilian_config 列失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 灌入薪资 / 学历 / 公司人数筛选项。
+     * <p>
+     * 代码来源：智联的前端 bundle 里只有参数名（{@code sl}/{@code el}/{@code cs}）
+     * 没有取值表，而完整字典在
+     * {@code https://fe-api.zhaopin.com/c/i/search/base/data}（2.1MB，顶层键
+     * {@code salaryType / educationType / companySize} …）。抓下来直接照抄即可，
+     * 比逐个码值去反推可靠得多。
+     * <p>
+     * 三个必须留意的点：
+     * <ol>
+     *   <li><b>薪资的 code 是"最低,最高"的区间对</b>（如 {@code 25001,35000}），
+     *       不是单个数字 —— 早期版本把配置里的裸数字直接当参数值发出去，
+     *       结果被服务端静默忽略，"薪资范围没有生效"就是这个原因。
+     *       实测服务端接受**任意**区间码（{@code 20000,9999999} 也生效），
+     *       所以旧的裸数字配置可以平滑迁移。</li>
+     *   <li>公司人数的排序不等于代码顺序：300-499人 的代码是 8，排在 100-299人 之后。</li>
+     *   <li>"不限"在字典里是 -1 / 0000,9999999，本项目统一用**留空**表示不加筛选，
+     *       所以这里不灌"不限"这一项。</li>
+     * </ol>
+     */
+    private void seedFilterOptions() {
+        Object[][] salary = {
+                {"4K以下", "0000,4000"}, {"4K-6K", "4001,6000"}, {"6K-8K", "6001,8000"},
+                {"8K-10K", "8001,10000"}, {"10K-15K", "10001,15000"}, {"15K-25K", "15001,25000"},
+                {"25K-35K", "25001,35000"}, {"35K-50K", "35001,50000"}, {"50K以上", "50001,9999999"},
+        };
+        Object[][] education = {
+                {"不限", "0"}, {"大专", "5"}, {"本科", "4"}, {"硕士", "3"}, {"博士", "1"},
+        };
+        Object[][] companySize = {
+                {"20人以下", "1"}, {"20-99人", "2"}, {"100-299人", "3"}, {"300-499人", "8"},
+                {"500-999人", "4"}, {"1000-9999人", "5"}, {"10000人以上", "6"},
+        };
+        seedOptionType("salary", salary);
+        seedOptionType("education", education);
+        seedOptionType("companySize", companySize);
+    }
+
+    private void seedOptionType(String type, Object[][] rows) {
+        try {
+            Long existing = zhilianOptionMapper.selectCount(
+                    new QueryWrapper<ZhilianOptionEntity>().eq("type", type));
+            if (existing != null && existing > 0) return; // 已有则不覆盖，避免冲掉用户改动
+
+            LocalDateTime now = LocalDateTime.now();
+            int sort = 0;
+            for (Object[] row : rows) {
+                ZhilianOptionEntity e = new ZhilianOptionEntity();
+                e.setType(type);
+                e.setName(String.valueOf(row[0]));
+                e.setCode(String.valueOf(row[1]));
+                e.setSortOrder(sort++);
+                e.setCreatedAt(now);
+                e.setUpdatedAt(now);
+                zhilianOptionMapper.insert(e);
+            }
+            log.info("zhilian_option 已初始化 {} 筛选项 {} 条", type, rows.length);
+        } catch (Exception e) {
+            log.warn("初始化 {} 筛选项失败: {}", type, e.getMessage());
+        }
     }
 
     public boolean existsByJobId(String jobId) {
@@ -251,6 +482,38 @@ public class ZhilianService {
         zhilianJobDataMapper.update(upd, uw);
     }
 
+    /**
+     * 标记为「已过滤」—— 命中黑名单、主动放弃投递的岗位。
+     * <p>
+     * ⚠️ <b>只在岗位还没投递过时才改状态。</b> 已经「已投递」的记录不能被降级成「已过滤」：
+     * 黑名单往往是事后才加的，把历史投递记录改成「已过滤」会丢掉真实投递事实
+     * （实测库里就有 {@code 客户公司：华为技术有限公司} 这种在加黑名单之前就投递成功的行）。
+     * 同时这个条件也让本方法天然幂等。
+     */
+    public void markFilteredByJobId(String jobId) {
+        if (jobId == null || jobId.trim().isEmpty()) return;
+        markFiltered(new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ZhilianJobDataEntity>()
+                .eq("job_id", jobId));
+    }
+
+    public void markFilteredByTitleAndCompany(String jobTitle, String companyName) {
+        if (jobTitle == null || companyName == null) return;
+        markFiltered(new com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ZhilianJobDataEntity>()
+                .eq("job_title", jobTitle).eq("company_name", companyName));
+    }
+
+    private void markFiltered(
+            com.baomidou.mybatisplus.core.conditions.update.UpdateWrapper<ZhilianJobDataEntity> uw) {
+        // 只覆盖"尚未投递"的行：null / 空串 / 未投递
+        uw.and(w -> w.isNull("delivery_status")
+                .or().eq("delivery_status", "")
+                .or().eq("delivery_status", "未投递"));
+        ZhilianJobDataEntity upd = new ZhilianJobDataEntity();
+        upd.setDeliveryStatus("已过滤");
+        upd.setUpdateTime(LocalDateTime.now());
+        zhilianJobDataMapper.update(upd, uw);
+    }
+
     // ==================== 投递分析（Dashboard）与列表 ====================
 
     /** 薪资解析结果 */
@@ -262,13 +525,22 @@ public class ZhilianService {
         public Long annualTotal;  // 年包（单位：元）
     }
 
-    /** 解析薪资字符串，支持示例：20-40K、35-65K·16薪、30K·15薪、面议（返回null） */
+    /**
+     * 解析薪资字符串，统一换算成「K/月」。
+     * <p>
+     * 同时支持智联新旧两种写法：
+     * <ul>
+     *   <li>旧页面：{@code 20-40K}、{@code 35-65K·16薪}、{@code 30K·15薪}</li>
+     *   <li>新页面：{@code 7000-10000元}、{@code 1.6-1.8万}、{@code 1-1.5万·13薪}</li>
+     * </ul>
+     * 旧实现只认 {@code ^\d+-\d+K$}，而新版搜索页返回的是「万 / 元」，
+     * 于是改版后投递分析里的薪资桶会整个空掉 —— 采集回来的数据等于白采。
+     * 「面议」这类没有数字的写法返回 null。
+     */
     public static SalaryInfo parseSalary(String salary) {
         if (salary == null) return null;
-        String s = salary.trim();
-        if (s.isEmpty()) return null;
-        if (s.contains("面议")) return null;
-        s = s.replace(" ", "");
+        String s = salary.trim().replace(" ", "");
+        if (s.isEmpty() || s.contains("面议")) return null;
 
         Integer months = 12;
         java.util.regex.Matcher mMonths = java.util.regex.Pattern.compile("[·\\.\\-]?([0-9]+)薪").matcher(s);
@@ -277,31 +549,36 @@ public class ZhilianService {
             s = s.substring(0, mMonths.start());
         }
 
-        Integer minK = null, maxK = null;
-        java.util.regex.Matcher mRange = java.util.regex.Pattern.compile("^(\\d+)-(\\d+)[Kk]$").matcher(s);
-        java.util.regex.Matcher mSingle = java.util.regex.Pattern.compile("^(\\d+)[Kk]$").matcher(s);
+        // 单位统一到 K/月：万 -> ×10；元 -> ÷1000；K / 千 -> ×1
+        double unit = 1.0;
+        if (s.contains("万")) unit = 10.0;
+        else if (s.contains("元")) unit = 0.001;
+
+        Double lo = null, hi = null;
+        java.util.regex.Matcher mRange = java.util.regex.Pattern
+                .compile("([0-9]+(?:\\.[0-9]+)?)[-~—至]([0-9]+(?:\\.[0-9]+)?)").matcher(s);
         if (mRange.find()) {
-            try { minK = Integer.parseInt(mRange.group(1)); maxK = Integer.parseInt(mRange.group(2)); } catch (Exception ignore) {}
-        } else if (mSingle.find()) {
-            try { minK = Integer.parseInt(mSingle.group(1)); maxK = minK; } catch (Exception ignore) {}
+            try {
+                lo = Double.parseDouble(mRange.group(1)) * unit;
+                hi = Double.parseDouble(mRange.group(2)) * unit;
+            } catch (Exception ignore) {}
         } else {
-            String cleaned = s.replaceAll("[^0-9Kk\\-]", "");
-            mRange = java.util.regex.Pattern.compile("^(\\d+)-(\\d+)[Kk]$").matcher(cleaned);
-            mSingle = java.util.regex.Pattern.compile("^(\\d+)[Kk]$").matcher(cleaned);
-            if (mRange.find()) {
-                try { minK = Integer.parseInt(mRange.group(1)); maxK = Integer.parseInt(mRange.group(2)); } catch (Exception ignore) {}
-            } else if (mSingle.find()) {
-                try { minK = Integer.parseInt(mSingle.group(1)); maxK = minK; } catch (Exception ignore) {}
+            java.util.regex.Matcher mSingle =
+                    java.util.regex.Pattern.compile("([0-9]+(?:\\.[0-9]+)?)").matcher(s);
+            if (mSingle.find()) {
+                try {
+                    lo = Double.parseDouble(mSingle.group(1)) * unit;
+                    hi = lo;
+                } catch (Exception ignore) {}
             }
         }
-
-        if (minK == null || maxK == null) return null;
+        if (lo == null || hi == null) return null;
 
         SalaryInfo info = new SalaryInfo();
-        info.minK = minK;
-        info.maxK = maxK;
+        info.minK = (int) Math.round(Math.min(lo, hi));
+        info.maxK = (int) Math.round(Math.max(lo, hi));
         info.months = months != null ? months : 12;
-        info.medianK = (minK + maxK) / 2.0;
+        info.medianK = (info.minK + info.maxK) / 2.0;
         info.annualTotal = Math.round(info.medianK * 1000 * info.months);
         return info;
     }

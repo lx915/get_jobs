@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, type Dispatch, type SetStateAction } from 'react'
 import { createSSEWithBackoff } from '@/lib/sse'
 import { createPortal } from 'react-dom'
-import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut } from 'react-icons/bi'
+import { BiBriefcase, BiSave, BiSearch, BiMap, BiMoney, BiBuilding, BiTime, BiBarChart, BiTrash, BiPlus, BiPlay, BiStop, BiLogOut, BiInfoCircle } from 'react-icons/bi'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
@@ -99,6 +99,12 @@ export default function BossPage() {
   const [loading, setLoading] = useState(true)
   const [isLoggedIn, setIsLoggedIn] = useState(false)
   const [isDelivering, setIsDelivering] = useState(false)
+  // 投递进度日志。
+  // 后端一直在通过 /api/boss/stream 推 SSE 进度（JobProgressMessage），但此前前端**完全没订阅**这个流，
+  // 于是点了「开始投递」之后界面上一点反应都没有；而且 isDelivering 除了"启动失败/用户点停止"之外
+  // 没有任何地方会复位，任务跑完了按钮还一直停在「停止投递」——看着就像点坏了一样。
+  const [deliveryLogs, setDeliveryLogs] = useState<{ type: string; message: string; ts: number }[]>([])
+  const deliveryLogRef = useRef<HTMLDivElement | null>(null)
   const [checkingLogin, setCheckingLogin] = useState(true)
   const [showLogoutDialog, setShowLogoutDialog] = useState(false)
   const [showSaveDialog, setShowSaveDialog] = useState(false)
@@ -160,6 +166,66 @@ export default function BossPage() {
       client.close()
     }
   }, [])
+
+  // 订阅投递进度流：把后端推的每条进度显示出来，并在任务结束时把按钮复位
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof EventSource === 'undefined') {
+      return
+    }
+
+    const client = createSSEWithBackoff(`${API_BASE}/api/boss/stream`, {
+      onError: () => {
+        // 断线由 createSSEWithBackoff 自己退避重连，这里不打扰用户
+      },
+      listeners: [
+        { name: 'connected', handler: () => {} },
+        {
+          name: 'progress',
+          handler: (event) => {
+            try {
+              const data = JSON.parse(event.data)
+              const message = String(data.message ?? '')
+              const type = String(data.type ?? 'info')
+              setDeliveryLogs((prev) =>
+                [...prev, { type, message, ts: Date.now() }].slice(-300),
+              )
+              // 终态必须复位，否则按钮会永远停在「停止投递」
+              if (type === 'success' || type === 'error' || message.includes('用户取消投递')) {
+                setIsDelivering(false)
+              }
+            } catch (error) {
+              console.error('[SSE] 解析Boss进度消息失败:', error)
+            }
+          },
+        },
+        { name: 'ping', handler: () => {} },
+      ],
+    })
+
+    return () => {
+      client.close()
+    }
+  }, [])
+
+  // 刷新页面后从后端同步真实运行状态，避免按钮与实际任务状态不一致
+  useEffect(() => {
+    fetch(`${API_BASE}/api/boss/status`)
+      .then((response) => response.json())
+      .then((data) => {
+        if (typeof data?.isRunning === 'boolean') {
+          setIsDelivering(data.isRunning)
+        }
+      })
+      .catch(() => {})
+  }, [])
+
+  // 日志追加后自动滚到底部
+  useEffect(() => {
+    const box = deliveryLogRef.current
+    if (box) {
+      box.scrollTop = box.scrollHeight
+    }
+  }, [deliveryLogs])
 
   const fetchAllData = async () => {
     try {
@@ -587,6 +653,60 @@ export default function BossPage() {
           </div>
         }
       />
+
+      {/* 投递进度面板：刻意放在 Tabs **之前**。
+          后端进度只在「平台配置」页可见的话，用户切到「投递分析」点完按钮就什么都看不到，
+          会误以为程序没反应。 */}
+      {(isDelivering || deliveryLogs.length > 0) && (
+        <Card className="animate-in fade-in duration-500">
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <BiInfoCircle className="text-primary" />
+              投递进度
+              {isDelivering ? (
+                <span className="text-xs font-normal text-teal-600">进行中…</span>
+              ) : (
+                <span className="text-xs font-normal text-muted-foreground">已结束</span>
+              )}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div
+              ref={deliveryLogRef}
+              className="max-h-64 space-y-1 overflow-y-auto rounded-md border bg-muted/30 p-3"
+            >
+              {deliveryLogs.length === 0 ? (
+                <p className="text-sm text-muted-foreground">等待任务输出…</p>
+              ) : (
+                deliveryLogs.map((log, i) => (
+                  <div
+                    key={i}
+                    className={`text-sm ${
+                      log.type === 'success'
+                        ? 'text-green-600'
+                        : log.type === 'error'
+                          ? 'text-red-600'
+                          : log.type === 'warning'
+                            ? 'text-amber-600'
+                            : 'text-foreground'
+                    }`}
+                  >
+                    <span className="text-muted-foreground">
+                      [{new Date(log.ts).toLocaleTimeString()}]
+                    </span>{' '}
+                    {log.message}
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="mt-2 flex justify-end">
+              <Button variant="ghost" size="sm" onClick={() => setDeliveryLogs([])}>
+                清空日志
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <Tabs defaultValue="config" className="w-full">
         <TabsList className="grid w-full grid-cols-2">
@@ -1026,7 +1146,10 @@ function MultiSelect({
 }: {
   options: BossOption[]
   selected: string[]
-  onChange: (v: string[]) => void
+  // 用 Dispatch<SetStateAction> 而不是 (v: string[]) => void：
+  // 组件内部必须走函数式更新，否则快速连点会基于过期的 selected 计算，
+  // 把前一次的选择丢掉（详见 toggle 的注释）
+  onChange: Dispatch<SetStateAction<string[]>>
   placeholder?: string
   onClose?: () => void
 }) {
@@ -1036,22 +1159,37 @@ function MultiSelect({
   const buttonRef = useRef<HTMLButtonElement>(null)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const [dropdownPosition, setDropdownPosition] = useState({ top: 0, left: 0, width: 0 })
+  // 首次测量完成前先隐藏面板，避免在 (0,0) 处闪一帧（visibility:hidden 仍可测量高度）
+  const [positioned, setPositioned] = useState(false)
 
   // 确保组件已挂载（解决 SSR 问题）
   useEffect(() => {
     setMounted(true)
   }, [])
 
-  // 计算下拉框位置
+  // 计算下拉框位置：下方放得下就向下弹；下方放不下且上方更宽裕时向上翻转。
+  // 之前只按「按钮底部 + 8px」算，而「薪资与经验要求」这类卡片位置靠下，
+  // 面板（最高 224px，见 globals.css 的 .dropdown-panel max-h-56）会整块溢出
+  // 视口底部 —— 用户看不见、点不到，表现成「选了没反应」。
   const updatePosition = useCallback(() => {
-    if (buttonRef.current) {
-      const rect = buttonRef.current.getBoundingClientRect()
-      setDropdownPosition({
-        top: rect.bottom + 8,
-        left: rect.left,
-        width: rect.width,
-      })
-    }
+    const btn = buttonRef.current
+    if (!btn) return
+    const rect = btn.getBoundingClientRect()
+    // 面板已被 max-h-56 限制在 224px 以内，这里再夹一次，测量失败时用上限兜底
+    const PANEL_MAX = 224
+    const GAP = 8
+    const panelHeight = Math.min(dropdownRef.current?.offsetHeight || PANEL_MAX, PANEL_MAX)
+    const spaceBelow = window.innerHeight - rect.bottom - GAP
+    const spaceAbove = rect.top - GAP
+    const openUp = spaceBelow < panelHeight && spaceAbove > spaceBelow
+    setDropdownPosition({
+      top: openUp
+        ? Math.max(GAP, rect.top - panelHeight - GAP)
+        : rect.bottom + GAP,
+      left: rect.left,
+      width: rect.width,
+    })
+    setPositioned(true)
   }, [])
 
   // 打开时计算位置
@@ -1067,6 +1205,8 @@ function MultiSelect({
         window.removeEventListener('resize', handleUpdate)
       }
     }
+    // 关闭时复位，下次打开重新测量
+    setPositioned(false)
   }, [open, updatePosition])
 
   // 点击组件外部或焦点移出时关闭下拉
@@ -1120,16 +1260,16 @@ function MultiSelect({
   }, [open, onClose])
 
   const toggle = (code: string) => {
-    console.log('[MultiSelect] toggle 被调用', { code, currentSelected: selected })
-    if (selected.includes(code)) {
-      const newSelected = selected.filter((c) => c !== code)
-      console.log('[MultiSelect] 取消选择，新值:', newSelected)
-      onChange(newSelected)
-    } else {
-      const newSelected = [...selected, code]
-      console.log('[MultiSelect] 添加选择，新值:', newSelected)
-      onChange(newSelected)
-    }
+    // 必须走函数式更新：这里的 selected 是上一次渲染的 props，
+    // 连续点击时（渲染还没把新数组回填进来）会读到过期数组，
+    // 后一次结果把前一次的勾选直接覆盖掉。
+    onChange((prev) => {
+      const next = prev.includes(code)
+        ? prev.filter((c) => c !== code)
+        : [...prev, code]
+      console.log('[MultiSelect] toggle', { code, from: prev, to: next })
+      return next
+    })
   }
 
   const selectedNames = options
@@ -1157,6 +1297,8 @@ function MultiSelect({
             top: `${dropdownPosition.top}px`,
             left: `${dropdownPosition.left}px`,
             width: `${dropdownPosition.width}px`,
+            // 测量完成前不显示，避免在 (0,0) 处闪现一帧
+            visibility: positioned ? 'visible' : 'hidden',
           }}
         >
           <div className="flex flex-col gap-2">

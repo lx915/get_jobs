@@ -43,7 +43,22 @@ public class BossJobService implements JobPlatformService {
             return;
         }
 
+        // 是否抢到了前台投递名额，finally 里据此精确释放
+        boolean foregroundAcquired = false;
         try {
+            // 同一时刻只允许一个平台跑投递：两个平台同时驱动同一条 Playwright 连接，
+            // 实测会让 Boss 连丢关键词（Object doesn't exist: frame@/handle@）。
+            // 抢占失败要**立刻**告诉用户，而不是排在专用线程后面无声等待。
+            String holder = playwrightManager.acquireForeground(PLATFORM);
+            if (holder != null) {
+                String msg = "另一个平台（" + holder + "）正在投递中，请等它结束后再启动 Boss。"
+                        + "两个平台同时驱动同一个浏览器会互相打断，导致关键词被整体跳过。";
+                log.warn("[boss] {}", msg);
+                progressCallback.accept(JobProgressMessage.error(PLATFORM, msg));
+                return;
+            }
+            foregroundAcquired = true;
+
             // 浏览器可能已经被关掉（手动关窗口 / Chrome 崩溃），这时各字段仍非空，
             // 但每个操作都会抛 TargetClosedError。先确保浏览器可用，必要时重新拉起。
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "检查浏览器状态..."));
@@ -74,6 +89,17 @@ public class BossJobService implements JobPlatformService {
             BossConfig config = configService.getBossConfig();
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "配置加载成功"));
 
+            // 调试模式（boss_config.debugger=1）下 resumeSubmission 会在点「立即沟通」之前直接
+            // return，整个任务只遍历、不投递，最后报"共发起0个聊天"。
+            // 这件事以前**只写进后端日志**，进度面板上看到的全是"正在投递：XXX"，
+            // 用户完全看不出这是干跑 —— 会被当成"投递失败"。所以这里必须显式提示。
+            boolean dryRun = Boolean.TRUE.equals(config.getDebugger());
+            if (dryRun) {
+                progressCallback.accept(JobProgressMessage.warning(PLATFORM,
+                        "当前是【调试模式】：只遍历岗位、不会真正发起沟通。"
+                                + "想真实投递，请在「平台配置」里把「调试模式」关掉并保存。"));
+            }
+
             progressCallback.accept(JobProgressMessage.info(PLATFORM, "开始投递任务..."));
 
             // 创建Boss实例并执行投递
@@ -97,8 +123,15 @@ public class BossJobService implements JobPlatformService {
             // Playwright 连接，导航被打断报 net::ERR_ABORTED，整个任务直接挂掉。
             int deliveredCount = playwrightManager.callOnPlaywright(boss::execute);
 
-            progressCallback.accept(JobProgressMessage.success(PLATFORM,
-                String.format("投递任务完成，共发起%d个聊天", deliveredCount)));
+            // 干跑时说成"完成"会让人以为投递失败。这里把"没投递"和"投递失败"分开说清楚。
+            if (dryRun) {
+                progressCallback.accept(JobProgressMessage.warning(PLATFORM,
+                        String.format("调试模式已结束：遍历了岗位但一个都没发起（共发起%d个聊天）。"
+                                + "关闭「调试模式」后重跑才会真实投递", deliveredCount)));
+            } else {
+                progressCallback.accept(JobProgressMessage.success(PLATFORM,
+                    String.format("投递任务完成，共发起%d个聊天", deliveredCount)));
+            }
         } catch (Exception e) {
             log.error("Boss投递任务执行失败", e);
             progressCallback.accept(JobProgressMessage.error(PLATFORM, "投递失败: " + e.getMessage()));
@@ -106,6 +139,9 @@ public class BossJobService implements JobPlatformService {
             isRunning = false;
             shouldStop = false;
             runningSince = 0L;
+            if (foregroundAcquired) {
+                playwrightManager.releaseForeground(PLATFORM);
+            }
             // 恢复后台登录监控
             try {
                 playwrightManager.resumeBossMonitoring();

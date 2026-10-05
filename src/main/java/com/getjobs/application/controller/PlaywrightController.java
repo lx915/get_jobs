@@ -99,6 +99,9 @@ public class PlaywrightController {
                   bodyLength: document.body ? document.body.innerHTML.length : 0,
                   jobCards: document.querySelectorAll('li.job-card-box, li.job-card-wrapper').length,
                   listContainers: document.querySelectorAll('ul.rec-job-list, ul.job-list-box, .job-list-box').length,
+                  bodyText: document.body ? document.body.innerText.replace(/\\s+/g, ' ').trim().slice(0, 260) : '',
+                  loginTeaser: !!document.querySelector('ul.login-desc-list'),
+                  avatar: !!document.querySelector('li.nav-figure'),
                   pending: performance.getEntriesByType('resource')
                              .filter(r => r.responseEnd === 0).map(r => r.name).slice(0, 8)
                 })""";
@@ -119,6 +122,25 @@ public class PlaywrightController {
                                 .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
                         result.put("navigateMs", System.currentTimeMillis() - start);
                         probe.waitForTimeout(5_000);
+
+                        // 列表页是懒加载：首屏只渲染 ~15 张卡，不滚动就无法比较"推荐 vs 筛选"到底差多少。
+                        // 这里滚到底直到连续两轮没有新增，把真实总数拉出来。
+                        int stable = 0;
+                        int last = -1;
+                        for (int round = 0; round < 25 && stable < 2; round++) {
+                            int now = countCards(probe);
+                            if (now == last) {
+                                stable++;
+                            } else {
+                                stable = 0;
+                            }
+                            last = now;
+                            probe.evaluate("() => window.scrollTo(0, document.body.scrollHeight)");
+                            probe.waitForTimeout(1_500);
+                        }
+                        result.put("cardsAfterScroll", countCards(probe));
+                        result.put("scrollRounds", last);
+
                         result.put("currentUrl", probe.url());
                         result.put("probe", probe.evaluate(probeJs));
                     } catch (Exception e) {
@@ -135,6 +157,26 @@ public class PlaywrightController {
                     }
                     out.put(target, result);
                 }
+                // 顺带把当前浏览器上下文在 zhipin.com 上的真实 Cookie 名单带出来：
+                // 登录态判定就是靠这几个 Cookie（bst/wt2/zp_at/geek_zp_token），
+                // 需要判断"真登录"还是"匿名访客也有的 Cookie"。
+                try {
+                    java.util.Set<String> names = new java.util.TreeSet<>();
+                    for (com.microsoft.playwright.options.Cookie c
+                            : playwrightManager.getContext().cookies("https://www.zhipin.com")) {
+                        names.add(c.name);
+                    }
+                    java.util.List<String> hit = new java.util.ArrayList<>();
+                    for (String k : new String[]{"bst", "wt2", "zp_at", "geek_zp_token"}) {
+                        if (names.contains(k)) {
+                            hit.add(k);
+                        }
+                    }
+                    out.put("liveCookieNames", names);
+                    out.put("liveLoginCookies", hit);
+                } catch (Exception e) {
+                    out.put("cookieError", String.valueOf(e.getMessage()));
+                }
                 return null;
             });
             out.put("success", true);
@@ -143,6 +185,16 @@ public class PlaywrightController {
             out.put("error", e.getMessage());
         }
         return ResponseEntity.ok(out);
+    }
+
+    /** 数当前页面上已渲染的岗位卡片数量（Boss 的几种卡片 class 都算上）。 */
+    private int countCards(Page page) {
+        try {
+            Object n = page.evaluate("() => document.querySelectorAll('li.job-card-box, li.job-card-wrapper').length");
+            return n instanceof Number ? ((Number) n).intValue() : 0;
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     /**
