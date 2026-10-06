@@ -19,6 +19,7 @@ import java.util.stream.Collectors;
 import jakarta.annotation.PostConstruct;
 import javax.sql.DataSource;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -626,7 +627,9 @@ public class ZhilianService {
         if (statuses != null && !statuses.isEmpty()) {
             wrapper.in("delivery_status", statuses.stream().filter(Objects::nonNull).map(String::trim).collect(Collectors.toSet()));
         }
-        if (location != null && !location.trim().isEmpty()) wrapper.eq("location", location.trim());
+        // 智联的地点存成了「城市·区」（如「北京·海淀区」），必须用包含匹配，
+        // 否则输入「北京」只能查到 location 恰好等于「北京」的那几条。
+        if (location != null && !location.trim().isEmpty()) wrapper.like("location", location.trim());
         if (experience != null && !experience.trim().isEmpty()) wrapper.eq("experience", experience.trim());
         if (degree != null && !degree.trim().isEmpty()) wrapper.eq("degree", degree.trim());
         if (keyword != null && !keyword.trim().isEmpty()) {
@@ -759,7 +762,9 @@ public class ZhilianService {
         if (statuses != null && !statuses.isEmpty()) {
             wrapper.in("delivery_status", statuses.stream().filter(Objects::nonNull).map(String::trim).collect(Collectors.toSet()));
         }
-        if (location != null && !location.trim().isEmpty()) wrapper.eq("location", location.trim());
+        // 智联的地点存成了「城市·区」（如「北京·海淀区」），必须用包含匹配，
+        // 否则输入「北京」只能查到 location 恰好等于「北京」的那几条。
+        if (location != null && !location.trim().isEmpty()) wrapper.like("location", location.trim());
         if (experience != null && !experience.trim().isEmpty()) wrapper.eq("experience", experience.trim());
         if (degree != null && !degree.trim().isEmpty()) wrapper.eq("degree", degree.trim());
 
@@ -796,6 +801,31 @@ public class ZhilianService {
         pr.page = page;
         pr.size = size;
         return pr;
+    }
+
+    /**
+     * 地点选项：对整表统计各地点的岗位数（不受当前筛选影响），供前端下拉直接选择。
+     * 智联的 location 是「城市·区」粒度，所以下拉里给的是完整值，
+     * 而筛选侧用包含匹配，用户手打「北京」也能命中所有北京区县。
+     */
+    public List<Map<String, Object>> getZhilianLocations() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String sql = "SELECT location AS name, COUNT(*) AS cnt FROM zhilian_data"
+                + " WHERE location IS NOT NULL AND TRIM(location) <> ''"
+                + " GROUP BY location ORDER BY cnt DESC, location ASC";
+        try (Connection conn = dataSource.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String, Object> m = new HashMap<>();
+                m.put("name", rs.getString("name"));
+                m.put("count", rs.getLong("cnt"));
+                out.add(m);
+            }
+        } catch (Exception e) {
+            log.warn("读取智联地点选项失败: {}", e.getMessage());
+        }
+        return out;
     }
 
     public static class PagedResult {

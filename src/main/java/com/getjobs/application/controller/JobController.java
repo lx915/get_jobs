@@ -512,6 +512,12 @@ public class JobController {
         return job51Service.listJob51(statusList, location, experience, degree, minK, maxK, keyword, page, size);
     }
 
+    /**
+     * 地点选项（整表去重 + 岗位数），供前端地点筛选下拉直接选择
+     */
+    @GetMapping("/51job/locations")
+    public List<Map<String, Object>> locations() { return job51Service.getJob51Locations(); }
+
     /** 刷新 job51_data，返回总数 */
     @GetMapping("/51job/reload")
     public Map<String, Object> reload() { return job51Service.reloadJob51Data(); }

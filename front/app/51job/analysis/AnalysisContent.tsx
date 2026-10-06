@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { LocationFilter } from "@/components/ui/location-filter"
 import { Label } from "@/components/ui/label"
 import PageHeader from "@/app/components/PageHeader"
 import { BiRefresh, BiDownload, BiBarChart, BiLineChart, BiPieChart, BiBriefcase } from "react-icons/bi"
@@ -208,7 +209,7 @@ export default function AnalysisContent({ showHeader = false }:{ showHeader?: bo
         </CardHeader>
         <CardContent>
           <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
-            <div><Label>城市</Label><Input value={location} onChange={e=>setLocation(e.target.value)} placeholder="如：深圳" /></div>
+            <div><Label>城市</Label><LocationFilter platform="51job" value={location} onChange={setLocation} placeholder="如：深圳" /></div>
             <div><Label>经验</Label><Input value={experience} onChange={e=>setExperience(e.target.value)} placeholder="如：3-5年" /></div>
             <div><Label>学历</Label><Input value={degree} onChange={e=>setDegree(e.target.value)} placeholder="如：本科" /></div>
             <div><Label>最低月薪(K)</Label><Input type="number" value={minK} onChange={e=>setMinK(e.target.value)} placeholder="10" /></div>

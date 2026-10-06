@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { LocationFilter } from "@/components/ui/location-filter"
 import { Select } from "@/components/ui/select"
 import { Label } from "@/components/ui/label"
 import PageHeader from "@/app/components/PageHeader"
@@ -593,7 +594,7 @@ export default function AnalysisContent({ showHeader = false }: { showHeader?: b
           <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
             <div>
               <Label>城市</Label>
-              <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="如：深圳" />
+              <LocationFilter platform="boss" value={location} onChange={setLocation} placeholder="如：北京" />
             </div>
             <div>
               <Label>经验</Label>

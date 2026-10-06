@@ -579,6 +579,15 @@ public class ZhilianController {
         return zhilianService.listZhilianJobs(statusList, location, experience, degree, minK, maxK, keyword, page, size);
     }
 
+    /**
+     * 地点选项（整表去重 + 岗位数），供前端地点筛选下拉直接选择。
+     * 智联的地点粒度是「城市·区」，下拉里给完整值可避免用户手打猜格式。
+     */
+    @GetMapping("/locations")
+    public List<Map<String, Object>> locations() {
+        return zhilianService.getZhilianLocations();
+    }
+
     // ==================== 任务管理相关接口 ====================
 
     /**

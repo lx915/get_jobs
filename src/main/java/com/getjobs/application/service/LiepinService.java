@@ -16,6 +16,7 @@ import java.util.*;
 import jakarta.annotation.PostConstruct;
 import javax.sql.DataSource;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.sql.PreparedStatement;
 import java.sql.Timestamp;
@@ -476,7 +477,8 @@ public class LiepinService {
                     wrapper.in("delivered", deliveredSet);
                 }
             }
-            if (location != null && !location.trim().isEmpty()) wrapper.eq("job_area", location.trim());
+            // 地点字段是 job_area，同样用包含匹配（猎聘存的是「城市·区」粒度）
+        if (location != null && !location.trim().isEmpty()) wrapper.like("job_area", location.trim());
             if (experience != null && !experience.trim().isEmpty()) wrapper.eq("job_exp_req", experience.trim());
             if (degree != null && !degree.trim().isEmpty()) wrapper.eq("job_edu_req", degree.trim());
 
@@ -633,7 +635,8 @@ public class LiepinService {
             }
             if (!deliveredSet.isEmpty()) wrapper.in("delivered", deliveredSet);
         }
-        if (location != null && !location.trim().isEmpty()) wrapper.eq("job_area", location.trim());
+        // 地点字段是 job_area，同样用包含匹配（猎聘存的是「城市·区」粒度）
+        if (location != null && !location.trim().isEmpty()) wrapper.like("job_area", location.trim());
         if (experience != null && !experience.trim().isEmpty()) wrapper.eq("job_exp_req", experience.trim());
         if (degree != null && !degree.trim().isEmpty()) wrapper.eq("job_edu_req", degree.trim());
 
@@ -671,5 +674,28 @@ public class LiepinService {
         pr.page = page;
         pr.size = size;
         return pr;
+    }
+
+    /**
+     * 地点选项：对整表统计各 job_area 的岗位数（不受当前筛选影响），供前端下拉直接选择。
+     */
+    public List<Map<String, Object>> getLiepinLocations() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String sql = "SELECT job_area AS name, COUNT(*) AS cnt FROM liepin_data"
+                + " WHERE job_area IS NOT NULL AND TRIM(job_area) <> ''"
+                + " GROUP BY job_area ORDER BY cnt DESC, job_area ASC";
+        try (Connection conn = dataSource.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String, Object> m = new HashMap<>();
+                m.put("name", rs.getString("name"));
+                m.put("count", rs.getLong("cnt"));
+                out.add(m);
+            }
+        } catch (Exception e) {
+            log.warn("读取猎聘地点选项失败: {}", e.getMessage());
+        }
+        return out;
     }
 }

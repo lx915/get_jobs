@@ -15,10 +15,13 @@ import org.springframework.stereotype.Service;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 @Service
@@ -563,7 +566,8 @@ public class Job51Service {
                 if (statuses.contains("未投递")) deliveredVals.add(0);
                 if (!deliveredVals.isEmpty()) wrapper.in("delivered", deliveredVals);
             }
-            if (location != null && !location.trim().isEmpty()) wrapper.eq("job_area", location.trim());
+            // 地点字段是 job_area，同样用包含匹配（51job 存的是「城市·区」粒度）
+        if (location != null && !location.trim().isEmpty()) wrapper.like("job_area", location.trim());
             if (experience != null && !experience.trim().isEmpty()) wrapper.eq("job_exp_req", experience.trim());
             if (degree != null && !degree.trim().isEmpty()) wrapper.eq("job_edu_req", degree.trim());
             if (keyword != null && !keyword.trim().isEmpty()) {
@@ -686,7 +690,8 @@ public class Job51Service {
             if (statuses.contains("未投递")) deliveredVals.add(0);
             if (!deliveredVals.isEmpty()) wrapper.in("delivered", deliveredVals);
         }
-        if (location != null && !location.trim().isEmpty()) wrapper.eq("job_area", location.trim());
+        // 地点字段是 job_area，同样用包含匹配（51job 存的是「城市·区」粒度）
+        if (location != null && !location.trim().isEmpty()) wrapper.like("job_area", location.trim());
         if (experience != null && !experience.trim().isEmpty()) wrapper.eq("job_exp_req", experience.trim());
         if (degree != null && !degree.trim().isEmpty()) wrapper.eq("job_edu_req", degree.trim());
         if (keyword != null && !keyword.trim().isEmpty()) {
@@ -798,6 +803,29 @@ public class Job51Service {
             resp.put("message", "刷新失败: " + e.getMessage());
         } finally { try { if (conn != null) conn.close(); } catch (Exception ignore) {} }
         return resp;
+    }
+
+    /**
+     * 地点选项：对整表统计各 job_area 的岗位数（不受当前筛选影响），供前端下拉直接选择。
+     */
+    public List<Map<String, Object>> getJob51Locations() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String sql = "SELECT job_area AS name, COUNT(*) AS cnt FROM job51_data"
+                + " WHERE job_area IS NOT NULL AND TRIM(job_area) <> ''"
+                + " GROUP BY job_area ORDER BY cnt DESC, job_area ASC";
+        try (Connection conn = dataSource.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("name", rs.getString("name"));
+                m.put("count", rs.getLong("cnt"));
+                out.add(m);
+            }
+        } catch (Exception e) {
+            log.warn("读取 51job 地点选项失败: {}", e.getMessage());
+        }
+        return out;
     }
 
     private long scalarCount(Connection conn, String sql) throws Exception {

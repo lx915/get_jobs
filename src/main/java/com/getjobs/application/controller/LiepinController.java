@@ -262,6 +262,14 @@ public class LiepinController {
     }
 
     /**
+     * 地点选项（整表去重 + 岗位数），供前端地点筛选下拉直接选择
+     */
+    @GetMapping("/locations")
+    public java.util.List<java.util.Map<String, Object>> locations() {
+        return liepinService.getLiepinLocations();
+    }
+
+    /**
      * 调试接口：读取数据库中的猎聘 Cookie 记录
      */
     @GetMapping("/cookie")

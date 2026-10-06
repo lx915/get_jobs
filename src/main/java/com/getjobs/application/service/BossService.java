@@ -900,7 +900,10 @@ public class BossService {
             if (statuses != null && !statuses.isEmpty()) {
                 wrapper.in("delivery_status", statuses);
             }
-            if (StringUtils.isNotBlank(location)) wrapper.eq("location", location);
+            // 地点用「包含」匹配而非精确相等：各平台的粒度并不统一
+        //（Boss 存「北京」，智联存「北京·海淀区」），精确匹配会让用户输入
+        //「北京」时一条都搜不到，与占位符提示的语义不符。
+        if (StringUtils.isNotBlank(location)) wrapper.like("location", location.trim());
             if (StringUtils.isNotBlank(experience)) wrapper.eq("experience", experience);
             if (StringUtils.isNotBlank(degree)) wrapper.eq("degree", degree);
 
@@ -1063,7 +1066,10 @@ public class BossService {
         if (statuses != null && !statuses.isEmpty()) {
             wrapper.in("delivery_status", statuses);
         }
-        if (StringUtils.isNotBlank(location)) wrapper.eq("location", location);
+        // 地点用「包含」匹配而非精确相等：各平台的粒度并不统一
+        //（Boss 存「北京」，智联存「北京·海淀区」），精确匹配会让用户输入
+        //「北京」时一条都搜不到，与占位符提示的语义不符。
+        if (StringUtils.isNotBlank(location)) wrapper.like("location", location.trim());
         if (StringUtils.isNotBlank(experience)) wrapper.eq("experience", experience);
         if (StringUtils.isNotBlank(degree)) wrapper.eq("degree", degree);
 
@@ -1108,6 +1114,32 @@ public class BossService {
         result.page = page;
         result.size = size;
         return result;
+    }
+
+    /**
+     * 地点选项：对整表统计各地点的岗位数（不受当前筛选影响），供前端下拉直接选择。
+     * <p>
+     * 不复用 /stats 的 charts.byCity：那个统计的是「已按条件过滤」且有条数上限的子集，
+     * 拿它当选项数据源会出现「一旦按地点筛选，其它地点就从下拉里消失」的怪现象。
+     */
+    public List<Map<String, Object>> getBossLocations() {
+        List<Map<String, Object>> out = new ArrayList<>();
+        String sql = "SELECT location AS name, COUNT(*) AS cnt FROM boss_data"
+                + " WHERE location IS NOT NULL AND TRIM(location) <> ''"
+                + " GROUP BY location ORDER BY cnt DESC, location ASC";
+        try (Connection conn = dataSource.getConnection();
+             Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(sql)) {
+            while (rs.next()) {
+                Map<String, Object> m = new HashMap<>();
+                m.put("name", rs.getString("name"));
+                m.put("count", rs.getLong("cnt"));
+                out.add(m);
+            }
+        } catch (Exception e) {
+            log.warn("读取 Boss 地点选项失败: {}", e.getMessage());
+        }
+        return out;
     }
 
     /**

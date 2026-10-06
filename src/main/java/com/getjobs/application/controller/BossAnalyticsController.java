@@ -91,6 +91,15 @@ public class BossAnalyticsController {
     }
 
     /**
+     * 地点选项（整表去重 + 岗位数），供前端地点筛选下拉直接选择，
+     * 免去用户猜「库里到底存的是『北京』还是『北京·海淀区』」。
+     */
+    @GetMapping("/locations")
+    public List<Map<String, Object>> locations() {
+        return bossService.getBossLocations();
+    }
+
+    /**
      * 刷新 boss_data（列顺序检查 + VACUUM）
      */
     @GetMapping("/reload")
