@@ -46,6 +46,17 @@ public class Locators {
     public static final String DIALOG_TITLE = "//div[@class='dialog-title']";
     public static final String DIALOG_CLOSE = "//i[@class='icon-close']";
     public static final String CHAT_INPUT = "//div[@id='chat-input']";
+    /**
+     * 聊天输入框（CSS 版，多形态容错）。
+     * <p>
+     * Boss 的聊天页改版过多次，输入框的 id / class / 标签都变过。这里把见过的形态都列上，
+     * 避免因为一处选择器过期就整个投递流程判失败（2026-10-06 实测：老代码只认
+     * {@code div#chat-input.chat-input[contenteditable='true'], textarea.input-area}，
+     * 结果 14 次投递全部误判为失败）。
+     */
+    public static final String CHAT_INPUT_ANY =
+            "div#chat-input.chat-input[contenteditable='true'], div.chat-input[contenteditable='true'], "
+                    + "div#chat-input, textarea.input-area, .chat-input [contenteditable='true']";
     public static final String DIALOG_CONTAINER = "//div[@class='dialog-container']";
     public static final String SEND_BUTTON = "//button[@type='send']";
     public static final String IMAGE_UPLOAD = "//div[@aria-label='发送图片']//input[@type='file']";

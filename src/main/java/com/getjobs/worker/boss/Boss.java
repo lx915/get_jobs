@@ -1234,27 +1234,64 @@ public class Boss {
         PlaywrightUtil.sleep(1);
 
         // 4. 等待聊天输入框
-        Locator inputLocator = detailPage.locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area");
-        boolean inputReady = false;
+        // 注意：Boss 的「立即沟通」是"点击即投递"——服务端会立刻用你账号里的打招呼语建立会话
+        // 并发出消息，按钮随即变成「继续沟通」。聊天输入框只用来追加自定义招呼语，而且它
+        // 不一定落在本页（Boss 会把聊天开在新标签页）。所以这里必须把两件事分开：
+        //   ① 能不能找到输入框  → 决定要不要再追加自定义文案
+        //   ② 沟通到底建没建立  → 决定这次投递算不算成功
+        // 老代码把 ② 当成 ①，找不到输入框就直接 return，于是把已经成功的投递记成了「未投递」。
+        Page chatPage = detailPage;
+        Locator inputLocator = null;
+        String establishedReason = null;
         for (int i = 0; i < 10; i++) {
             if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                 log.info("停止指令已触发，结束等待聊天输入框 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
                 try { detailPage.close(); } catch (Exception ignore) {}
                 return;
             }
-            if (inputLocator.count() > 0 && inputLocator.first().isVisible()) {
-                inputReady = true;
+            inputLocator = tryChatInput(detailPage);
+            if (inputLocator == null) {
+                // 聊天可能被 Boss 开成了新标签页。只认 /web/geek/chat 的页面，
+                // 不去碰常驻的搜索列表页（它上面也可能有貌似输入框的元素，误判代价很大）。
+                for (Page p : safeContextPages(detailPage)) {
+                    if (p == detailPage || p == page) {
+                        continue;
+                    }
+                    String u = safeUrlOf(p);
+                    if (u == null || !u.contains("/web/geek/chat")) {
+                        continue;
+                    }
+                    Locator other = tryChatInput(p);
+                    if (other != null) {
+                        inputLocator = other;
+                        chatPage = p;
+                        log.info("聊天输入框出现在新标签页：{}", u);
+                        break;
+                    }
+                }
+            }
+            if (inputLocator != null) {
                 break;
+            }
+            if (establishedReason == null) {
+                establishedReason = detectDeliveryEstablished(detailPage);
             }
             PlaywrightUtil.sleep(1);
         }
-        if (!inputReady) {
-            log.warn("聊天输入框未出现，跳过: {}", job.getJobName());
-            // 关闭详情页
-            try {
-                detailPage.close();
-            } catch (Exception ignore) {
+        if (inputLocator == null) {
+            if (establishedReason != null) {
+                // 投递其实已经完成，只是找不到输入框（没法再追加自定义招呼语）。
+                // 这是一次真实投递，必须落库，否则面板少报、库里留下假的「未投递」。
+                log.info("未找到聊天输入框，但检测到沟通已建立（{}）⇒ 按投递成功计 | 公司：{} | 岗位：{}",
+                        establishedReason, job.getCompanyName(), job.getJobName());
+                closePagesQuietly(detailPage);
+                updateJobDeliveryStatus(job, detailUrl, "已投递");
+                resultList.add(job);
+                return;
             }
+            log.warn("聊天输入框未出现且未检测到投递证据，跳过: {} | 现场：{}",
+                    job.getJobName(), dumpPageDiagnostic(detailPage));
+            closePagesQuietly(detailPage);
             return;
         }
 
@@ -1275,7 +1312,7 @@ public class Boss {
 
         boolean sendSuccess = false;
         boolean imgResume = false;
-        // 从输入招呼语开始，任何一步抛异常都必须保证详情页被关掉。
+        // 从输入招呼语开始，任何一步抛异常都必须保证新开的标签页被关掉。
         // 否则聊天弹窗会一直留在浏览器里（用户截图里那个「订阅回复消息」窗口就是这么残留的），
         // 之后每个关键词的导航和列表渲染都会被它干扰。
         try {
@@ -1291,62 +1328,179 @@ public class Boss {
             }
 
             // 7. 点击发送按钮（div.send-message 或 button.btn-send）
-            Locator sendText = detailPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
+            // 发送按钮要在「聊天所在的那个标签页」上找，它不一定是详情页。
+            Locator sendText = chatPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
             if (sendText.count() > 0) {
                 sendText.first().click();
                 PlaywrightUtil.sleep(1);
                 sendSuccess = true;
                 try {
-                    detailPage.locator("i.icon-close").first().click();
+                    chatPage.locator("i.icon-close").first().click();
                 } catch (Exception e) {
-                    log.error("发送文本小窗口关闭失败！");
+                    log.debug("发送文本小窗口关闭失败（不影响投递结果）");
                 }
             } else {
-                log.warn("未找到发送按钮，自动跳过！岗位：{}", job.getJobName());
+                log.warn("未找到发送按钮，自定义招呼语未能追加（Boss 已自动发出账号侧的打招呼语）。岗位：{}", job.getJobName());
             }
 
             // 8. 发送图片简历（可选）
             if (Boolean.TRUE.equals(config.getSendImgResume())) {
-                imgResume = sendImageResume(detailPage);
+                imgResume = sendImageResume(chatPage);
             }
 
-            log.info("投递完成 | 公司：{} | 岗位：{} | 薪资：{} | 招呼语：{} | 图片简历：{}", job.getCompanyName(), job.getJobName(), job.getSalary(), message, imgResume ? "已发送" : "未发送");
+            log.info("投递完成 | 公司：{} | 岗位：{} | 薪资：{} | 自定义招呼语：{} | 图片简历：{}", job.getCompanyName(), job.getJobName(), job.getSalary(), sendSuccess ? "已追加" : "未追加", imgResume ? "已发送" : "未发送");
+        } catch (Exception e) {
+            // 不吞掉事实：能走到这一步说明输入框已找到（聊天页已打开 = 沟通已建立），
+            // 只是追加文案这一步失败了，不该因此把这次投递判成失败。
+            log.warn("追加自定义招呼语阶段异常（投递本身可能已建立）：{} | 公司：{} | 岗位：{}",
+                    e.getMessage(), job.getCompanyName(), job.getJobName());
         } finally {
-            // 9. 无论成功失败都关闭新打开的详情页
-            try {
-                detailPage.close();
-            } catch (Exception ignore) {
-            }
+            // 9. 无论成功失败都关闭本次新开的标签页
+            closePagesQuietly(chatPage, detailPage);
             PlaywrightUtil.sleep(1);
         }
 
         // 10. 更新数据库投递状态 & 成功投递加入结果
-        if (sendSuccess) {
-            // 从详情链接提取 encrypt_id，并映射到 encrypt_user_id
-            String encryptId = extractEncryptId(detailUrl);
-            String encryptUserId = encryptId != null ? encryptIdToUserId.get(encryptId) : null;
-            if (encryptId != null && encryptUserId != null) {
-                try {
-        bossService.updateDeliveryStatus(encryptId, encryptUserId, "已投递");
-                    log.info("投递成功 | 公司：{} | 岗位：{} | encryptId：{} | encryptUserId：{}", job.getCompanyName(), job.getJobName(), encryptId, encryptUserId);
-                } catch (Exception e) {
-                    log.warn("更新投递状态为已投递失败：{}", e.getMessage());
-                }
+        // 能走到这里说明输入框已找到 = 聊天页已打开 = 沟通已建立 = 投递本身已经成功
+        // （点「立即沟通」那一刻 Boss 就把招呼语发出去了）。自定义招呼语没追加成功
+        // 只影响文案，不改变"已投递"这个事实。
+        if (!sendSuccess) {
+            log.warn("投递已建立，但自定义招呼语未追加成功 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
+        }
+        updateJobDeliveryStatus(job, detailUrl, "已投递");
+        resultList.add(job);
+    }
+
+    /**
+     * 落库投递状态。
+     * <p>
+     * 只按 {@code encrypt_id} 定位即可——服务层的 {@code updateDeliveryStatus} 在
+     * {@code encryptUserId} 为 null 时会自动省略该条件。老代码要求两个字段都非空才更新，
+     * 于是 encrypt_user_id 没抓到的那批岗位，状态会永远停在「未投递」。
+     */
+    private void updateJobDeliveryStatus(Job job, String detailUrl, String status) {
+        String encryptId = extractEncryptId(detailUrl);
+        if (encryptId == null) {
+            log.warn("未能从详情链接解析出 encryptId，投递状态未更新（目标状态：{}）| 岗位：{} | detailUrl：{}",
+                    status, job.getJobName(), detailUrl);
+            return;
+        }
+        String encryptUserId = encryptIdToUserId.get(encryptId);
+        try {
+            bossService.updateDeliveryStatus(encryptId, encryptUserId, status);
+            if ("已投递".equals(status)) {
+                log.info("投递成功 | 公司：{} | 岗位：{} | encryptId：{} | encryptUserId：{}",
+                        job.getCompanyName(), job.getJobName(), encryptId, encryptUserId);
             } else {
-                log.debug("未能找到 encryptId/encryptUserId 用于更新投递状态，detailUrl: {}", detailUrl);
+                log.warn("投递失败 | 公司：{} | 岗位：{} | encryptId：{} | encryptUserId：{}",
+                        job.getCompanyName(), job.getJobName(), encryptId, encryptUserId);
             }
-            resultList.add(job);
-        } else {
-            // 若发生发送失败，也进行状态更新
-            String encryptId = extractEncryptId(detailUrl);
-            String encryptUserId = encryptId != null ? encryptIdToUserId.get(encryptId) : null;
-            if (encryptId != null && encryptUserId != null) {
-                try {
-        bossService.updateDeliveryStatus(encryptId, encryptUserId, "投递失败");
-                    log.warn("投递失败 | 公司：{} | 岗位：{} | encryptId：{} | encryptUserId：{}", job.getCompanyName(), job.getJobName(), encryptId, encryptUserId);
-                } catch (Exception e) {
-                    log.warn("更新投递状态为投递失败异常：{}", e.getMessage());
+        } catch (Exception e) {
+            log.warn("更新投递状态为「{}」失败：{}", status, e.getMessage());
+        }
+    }
+
+    /** 在指定标签页里找可见的聊天输入框；找不到返回 null（顺带吃掉瞬时异常）。 */
+    private Locator tryChatInput(Page p) {
+        if (p == null) {
+            return null;
+        }
+        try {
+            Locator l = p.locator(CHAT_INPUT_ANY);
+            if (l.count() > 0 && l.first().isVisible()) {
+                return l;
+            }
+        } catch (Exception ignore) {
+            // 页面正在导航/被关闭时会抛瞬时异常，视为"没找到"继续等
+        }
+        return null;
+    }
+
+    /** 取上下文里所有标签页；取不到时返回空列表而不是 null。 */
+    private List<Page> safeContextPages(Page p) {
+        try {
+            return new ArrayList<>(p.context().pages());
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    private String safeUrlOf(Page p) {
+        try {
+            return p.url();
+        } catch (Exception e) {
+            return "(取不到URL)";
+        }
+    }
+
+    /**
+     * 判断「这次点击是否真的建立了沟通」——Boss 的「立即沟通」本身就是投递动作。
+     * <p>
+     * 任一命中即认为已投递：① 上下文里出现了聊天页；② 详情页按钮已从「立即沟通」变成「继续沟通」。
+     * 返回命中原因，未命中返回 null。
+     */
+    private String detectDeliveryEstablished(Page detailPage) {
+        try {
+            for (Page p : safeContextPages(detailPage)) {
+                String u = safeUrlOf(p);
+                if (u != null && u.contains("/web/geek/chat")) {
+                    return "已打开聊天页 " + u;
                 }
+            }
+        } catch (Exception ignore) {
+        }
+        try {
+            Object text = detailPage.evaluate("""
+                    () => {
+                      const btn = document.querySelector('a.op-btn-chat, a.btn-startchat, .btn-startchat');
+                      return btn ? btn.textContent.trim() : '';
+                    }""");
+            String t = str(text);
+            if (t.contains("继续沟通") || t.contains("继续联系") || t.contains("已沟通") || t.contains("已投递")) {
+                return "详情页按钮已变为「" + t + "」";
+            }
+        } catch (Exception ignore) {
+        }
+        return null;
+    }
+
+    /** 投递判定失败时，把页面现场 dump 出来，避免下次还要靠猜。 */
+    private String dumpPageDiagnostic(Page detailPage) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            sb.append("detailUrl=").append(safeUrlOf(detailPage));
+            List<Page> pages = safeContextPages(detailPage);
+            sb.append(" 标签页数=").append(pages.size());
+            for (Page p : pages) {
+                sb.append(" [").append(safeUrlOf(p)).append("]");
+            }
+        } catch (Exception ignore) {
+        }
+        try {
+            Object body = detailPage.evaluate(
+                    "() => document.body ? document.body.innerText.replace(/\\s+/g, ' ').trim().slice(0, 200) : ''");
+            sb.append(" 正文=").append(str(body));
+        } catch (Exception ignore) {
+        }
+        return sb.toString();
+    }
+
+    /** 静默关闭若干标签页，但绝不动常驻的搜索列表页。 */
+    private void closePagesQuietly(Page... pages) {
+        if (pages == null) {
+            return;
+        }
+        Set<Integer> seen = new HashSet<>();
+        for (Page p : pages) {
+            if (p == null || p == page) {
+                continue;
+            }
+            try {
+                if (!seen.add(System.identityHashCode(p))) {
+                    continue;
+                }
+                p.close();
+            } catch (Exception ignore) {
             }
         }
     }
