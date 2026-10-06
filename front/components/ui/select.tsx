@@ -22,6 +22,8 @@ const Select = React.forwardRef<HTMLDivElement, SelectProps>(
     const buttonRef = React.useRef<HTMLButtonElement>(null)
     const dropdownRef = React.useRef<HTMLDivElement>(null)
     const [dropdownPosition, setDropdownPosition] = React.useState({ top: 0, left: 0, width: 0 })
+    // 首次测量完成前先隐藏面板，避免在 (0,0) 处闪一帧（visibility:hidden 仍可测量高度）
+    const [positioned, setPositioned] = React.useState(false)
 
     // 确保组件已挂载（解决 SSR 问题）
     React.useEffect(() => {
@@ -38,16 +40,31 @@ const Select = React.forwardRef<HTMLDivElement, SelectProps>(
 
     const emitChange = (val: string) => onChange?.({ target: { value: val } } as any)
 
-    // 计算下拉框位置
+    // 计算下拉框位置：下方放得下就向下弹；下方放不下且上方更宽裕时向上翻转。
+    // 之前只按「按钮底部 + 8px」算，而分页条、表格下方的表单都贴在视口底部，
+    // 面板（最高 224px，见 globals.css 的 .dropdown-panel max-h-56）会整块溢出
+    // 视口底部 —— 用户看不见、点不到「每页」的候选项，表现成「选了看不到 size」。
     const updatePosition = React.useCallback(() => {
-      if (buttonRef.current) {
-        const rect = buttonRef.current.getBoundingClientRect()
-        setDropdownPosition({
-          top: rect.bottom + 8,
-          left: rect.left,
-          width: rect.width,
-        })
-      }
+      const btn = buttonRef.current
+      if (!btn) return
+      const rect = btn.getBoundingClientRect()
+      // 面板已被 max-h-56 限制在 224px 以内，这里再夹一次，测量失败时用上限兜底
+      const PANEL_MAX = 224
+      const GAP = 8
+      const panelHeight = Math.min(dropdownRef.current?.offsetHeight || PANEL_MAX, PANEL_MAX)
+      const spaceBelow = window.innerHeight - rect.bottom - GAP
+      const spaceAbove = rect.top - GAP
+      const openUp = spaceBelow < panelHeight && spaceAbove > spaceBelow
+      // 向下弹时再夹一次上边界，保证「下方略不够、上方也不宽裕」时面板仍完整可见
+      const maxTop = Math.max(GAP, window.innerHeight - panelHeight - GAP)
+      setDropdownPosition({
+        top: openUp
+          ? Math.max(GAP, rect.top - panelHeight - GAP)
+          : Math.min(rect.bottom + GAP, maxTop),
+        left: rect.left,
+        width: rect.width,
+      })
+      setPositioned(true)
     }, [])
 
     // 打开时计算位置
@@ -63,6 +80,8 @@ const Select = React.forwardRef<HTMLDivElement, SelectProps>(
           window.removeEventListener('resize', handleUpdate)
         }
       }
+      // 关闭时复位，下次打开重新测量
+      setPositioned(false)
     }, [open, updatePosition])
 
     // 点击外部关闭下拉框
@@ -128,6 +147,8 @@ const Select = React.forwardRef<HTMLDivElement, SelectProps>(
                 top: `${dropdownPosition.top}px`,
                 left: `${dropdownPosition.left}px`,
                 width: `${dropdownPosition.width}px`,
+                // 测量完成前不显示，避免在 (0,0) 处闪现一帧
+                visibility: positioned ? 'visible' : 'hidden',
               }}
             >
               <ul className="py-1">
